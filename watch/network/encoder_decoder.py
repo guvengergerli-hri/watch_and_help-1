@@ -45,7 +45,11 @@ def _sort_by_index(list_of_tensor, idx):
 
 class GraphDemo2Predicate(nn.Module):
 
-    summary_keys = ['loss', 'top1']
+    summary_keys = [
+        'loss', 'top1', 'acc', 'precision', 'recall', 'f1',
+        'confidence', 'pred_entropy', 'pred_entropy_norm',
+        'top_class_frac', 'unique_pred_classes', 'unique_pred_classes_frac'
+    ]
     def __init__(self, args, dset, **kwargs):
         from network.module_graph import PredicateClassifier, PredicateClassifierMultiClassifier
         super(GraphDemo2Predicate, self).__init__()
@@ -80,8 +84,25 @@ class GraphDemo2Predicate(nn.Module):
             demo_encoder = GraphDemoEncoder(args, dset, 'bilstmlast')
         else:
             raise ValueError
-        demo_encoder = torch.nn.DataParallel(demo_encoder)
-
+        
+        # DataParallel can duplicate graph batches because this code passes nested Python
+        # containers (lists/dicts), which are not safely scattered across devices.
+        use_dp = (
+            torch.cuda.is_available()
+            and args.use_data_parallel
+            and args.gpu_id is not None
+            and len(args.gpu_id) > 1
+            and self.inputtype != 'graphinput'
+        )
+        if torch.cuda.is_available() and args.use_data_parallel and self.inputtype == 'graphinput':
+            print(colored("Warning: disabling DataParallel for graphinput to avoid batch duplication.", 'yellow'))
+        if use_dp:
+            try:
+                demo_encoder = torch.nn.DataParallel(demo_encoder)
+            except Exception as e:
+                print(colored("Warning: DataParallel init failed, falling back to single GPU mode: {}".format(str(e)), 'yellow'))
+                demo_encoder = demo_encoder
+        
         if self.multi_classifier:
             predicate_decoder = PredicateClassifierMultiClassifier(args, dset)
         else:
@@ -157,7 +178,11 @@ class GraphDemo2Predicate(nn.Module):
 
 class ActionDemo2Predicate(nn.Module):
 
-    summary_keys = ['loss', 'top1']
+    summary_keys = [
+        'loss', 'top1', 'acc', 'precision', 'recall', 'f1',
+        'confidence', 'pred_entropy', 'pred_entropy_norm',
+        'top_class_frac', 'unique_pred_classes', 'unique_pred_classes_frac'
+    ]
     def __init__(self, args, dset, **kwargs):
         from network.module_graph import PredicateClassifier
         super(ActionDemo2Predicate, self).__init__()
@@ -189,7 +214,21 @@ class ActionDemo2Predicate(nn.Module):
             demo_encoder = ActionDemoEncoder(args, dset, 'bilstmlast')
         else:
             raise ValueError
-        demo_encoder = torch.nn.DataParallel(demo_encoder)
+        use_dp = (
+            torch.cuda.is_available()
+            and args.use_data_parallel
+            and args.gpu_id is not None
+            and len(args.gpu_id) > 1
+            and args.inputtype != 'graphinput'
+        )
+        if torch.cuda.is_available() and args.use_data_parallel and args.inputtype == 'graphinput':
+            print(colored("Warning: disabling DataParallel for graphinput to avoid batch duplication.", 'yellow'))
+        if use_dp:
+            try:
+                demo_encoder = torch.nn.DataParallel(demo_encoder)
+            except Exception as e:
+                print(colored("Warning: DataParallel init failed, falling back to single GPU mode: {}".format(str(e)), 'yellow'))
+                demo_encoder = demo_encoder
 
         predicate_decoder = PredicateClassifier(args, dset)
         
@@ -257,7 +296,3 @@ class ActionDemo2Predicate(nn.Module):
                 path,
                 map_location=lambda storage,
                 loc: storage))
-
-
-
-

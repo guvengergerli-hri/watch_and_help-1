@@ -90,7 +90,7 @@ class ActorCritic(nn.Module):
 
 
     def is_cuda(self):
-        return torch.cuda.is_available()
+        return next(self.parameters()).is_cuda
 
     def forward(self, inputs, rnn_hxs, masks):
         raise NotImplementedError
@@ -98,9 +98,10 @@ class ActorCritic(nn.Module):
     def act(self, inputs, rnn_hxs, masks=None, deterministic=False, epsilon=0.0, action_indices=None):
         # ipdb.set_trace()
         if self.is_cuda():
+            model_device = next(self.parameters()).device
             new_inputs = {}
             for name, inp in inputs.items():
-                new_inputs[name] = inp.cuda()
+                new_inputs[name] = inp.to(model_device)
             inputs = new_inputs
         affordance_obj1 = inputs['affordance_matrix']
         # ipdb.set_trace()
@@ -199,4 +200,3 @@ class ActorCritic(nn.Module):
             dist_entropy.append(dist.entropy().mean())
 
         return value, action_log_probs, dist_entropy, rnn_hxs
-

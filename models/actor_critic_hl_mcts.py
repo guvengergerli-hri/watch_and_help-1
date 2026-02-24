@@ -80,7 +80,7 @@ class ActorCritic(nn.Module):
 
 
     def is_cuda(self):
-        return torch.cuda.is_available()
+        return next(self.parameters()).is_cuda
 
     def forward(self, inputs, rnn_hxs, masks):
         raise NotImplementedError
@@ -88,9 +88,10 @@ class ActorCritic(nn.Module):
     def act(self, inputs, rnn_hxs, masks=None, deterministic=False, epsilon=0.0, action_indices=None):
 
         if self.is_cuda():
+            model_device = next(self.parameters()).device
             new_inputs = {}
             for name, inp in inputs.items():
-                new_inputs[name] = inp.cuda()
+                new_inputs[name] = inp.to(model_device)
             inputs = new_inputs
         affordance_obj1 = inputs['affordance_matrix']
 
@@ -143,7 +144,6 @@ class ActorCritic(nn.Module):
             #print('PROBABILITY', actions_probs[action])
         outputs = None
         return value, actions, actions_probs, rnn_hxs, outputs
-
 
 
 

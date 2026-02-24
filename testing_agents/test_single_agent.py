@@ -1,17 +1,18 @@
 import sys
 import os
-import ipdb
 import pickle
 import json
 import random
 import numpy as np
 from pathlib import Path
 
+curr_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(f'{curr_dir}/..')
+
 from envs.unity_environment import UnityEnvironment
 from agents import MCTS_agent
 from arguments import get_args
 from algos.arena_mp2 import ArenaMP
-from utils import utils_goals
 
 
 
@@ -21,14 +22,22 @@ if __name__ == '__main__':
     args = get_args()
 
     num_tries = 5
-    args.max_episode_length = 250
-    args.num_per_apartment = 20
-    args.dataset_path = './dataset/test_env_set_help.pik'
-    args.mode = 'hp'
+    if args.max_episode_length == 200:
+        args.max_episode_length = 250
+    if args.num_per_apartment == 3:
+        args.num_per_apartment = 20
+    if args.dataset_path is None:
+        args.dataset_path = './dataset/test_env_set_help.pik'
+    if args.mode == 'full':
+        args.mode = 'hp'
     env_task_set = pickle.load(open(args.dataset_path, 'rb'))
 
 
-    args.record_dir = '../test_results/multiAlice_env_task_set_{}_{}'.format(args.num_per_apartment, args.mode)
+    if args.dataset_path == './dataset/test_env_set_help.pik':
+        args.record_dir = '../test_results/multiAlice_env_task_set_{}_{}'.format(args.num_per_apartment, args.mode)
+    else:
+        dataset_name = Path(args.dataset_path).stem
+        args.record_dir = '../test_results/multiAlice_{}_{}'.format(dataset_name, args.mode)
     if not os.path.exists(args.record_dir):
         os.makedirs(args.record_dir)
 
@@ -100,6 +109,10 @@ if __name__ == '__main__':
             if os.path.isfile(curr_log_file_name):
                 with open(curr_log_file_name, 'rb') as fd:
                     file_data = pickle.load(fd)
+                while len(S[episode_id]) <= current_tried:
+                    S[episode_id].append(0)
+                while len(L[episode_id]) <= current_tried:
+                    L[episode_id].append(0)
                 S[episode_id][current_tried] = file_data['finished']
                 L[episode_id][current_tried] = max(len(file_data['action'][0]), len(file_data['action'][1]))
                 test_results[episode_id] = {'S': S[episode_id],
@@ -133,9 +146,11 @@ if __name__ == '__main__':
                 else:
                     with open(log_file_name, 'w+') as f:
                         f.write(json.dumps(saved_info, indent=4))
-            except:
-                ipdb.set_trace()
+            except Exception as exc:
+                print(f'Exception on episode {episode_id}: {exc}')
                 arena.reset_env()
+                is_finished = 0
+                steps = args.max_episode_length
 
             S[episode_id].append(is_finished)
             L[episode_id].append(steps)
@@ -146,4 +161,3 @@ if __name__ == '__main__':
         print('average steps (finishing the tasks):', np.array(steps_list).mean() if len(steps_list) > 0 else None)
         print('failed_tasks:', failed_tasks)
         pickle.dump(test_results, open(args.record_dir + '/results_{}.pik'.format(0), 'wb'))
-

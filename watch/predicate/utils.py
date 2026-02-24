@@ -40,6 +40,8 @@ def grab_args():
     parser.add_argument('--demo_hidden', type=int, default=128)
     parser.add_argument('--multi_classifier', type=int, default=0)
     parser.add_argument('--transformer_nhead', type=int, default=2)
+    parser.add_argument('--use_data_parallel', type=int, default=0,
+                        help='set to 1 to wrap watch encoder in torch.nn.DataParallel')
     
 
     # train config
@@ -190,8 +192,7 @@ def summary_eval(
     model.eval()
     with torch.no_grad():
 
-        loss_list = []
-        top1_list = []
+        scalar_lists = {"loss": [], "top1": []}
         iter = 0
         
         prob = []
@@ -199,19 +200,37 @@ def summary_eval(
         file_name = []
         for batch_data in loader:
             loss, info = model(batch_data)
-            loss_list.append(loss.cpu().item())
-            top1_list.append(info['top1'])
+            # Collect all scalar metrics produced by the model.
+            scalar_lists["loss"].append(loss.cpu().item())
+            for k, v in info.items():
+                if k in ['prob', 'target', 'file_name']:
+                    continue
+                if isinstance(v, (int, float, np.floating, np.integer)):
+                    scalar_lists.setdefault(k, []).append(float(v))
+                elif hasattr(v, 'shape') and np.ndim(v) == 0:
+                    scalar_lists.setdefault(k, []).append(float(v))
 
             prob.append(info['prob'])
             target.append(info['target'])
             file_name.append(info['file_name'])
 
             if iter%10==0:
-                print('testing %d / %d: loss %.4f: acc %.4f' % (iter, len(loader), loss, info['top1']))
+                msg = 'testing %d / %d: loss %.4f: top1 %.4f' % (iter, len(loader), loss, info['top1'])
+                if 'acc' in info:
+                    msg += ' | acc %.4f f1 %.4f conf %.2f ent_n %.4f' % (
+                        info.get('acc', -1),
+                        info.get('f1', -1),
+                        info.get('confidence', -1),
+                        info.get('pred_entropy_norm', -1),
+                    )
+                print(msg)
 
             iter += 1
 
-    info = {"loss": sum(loss_list)/ len(loss_list), "top1": sum(top1_list)/ len(top1_list), "prob": prob, "target": target, "file_name": file_name}
+    info = {"prob": prob, "target": target, "file_name": file_name}
+    for k, vals in scalar_lists.items():
+        if len(vals) > 0:
+            info[k] = float(sum(vals) / len(vals))
     return info
 
 
@@ -222,4 +241,3 @@ def save(args, i, checkpoint_dir, model):
     # save_path = '{}/demo2predicate-{}.ckpt'.format(checkpoint_dir, i)    
     save_path = '{}/demo2predicate-{}.ckpt'.format(checkpoint_dir, 'best_model')
     model.save(save_path, True)
-

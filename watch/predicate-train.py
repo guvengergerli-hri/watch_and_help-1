@@ -154,7 +154,8 @@ def train(
             'test')
         
         print_output(args, info['prob'], info['target'], info['file_name'], test_dset)
-        print('test top1', info['top1'])
+        print('test top1 {:.4f} | acc {:.4f} | precision {:.4f} | recall {:.4f} | f1 {:.4f}'.format(
+            info['top1'], info.get('acc', -1), info.get('precision', -1), info.get('recall', -1), info.get('f1', -1)))
         
         return 0
 
@@ -172,7 +173,9 @@ def train(
                 batch_data, info, loss = results
 
                 if iter % 10 == 0:
-                    print('%s: training %d / %d: loss %.4f: acc %.4f' % (args.checkpoint, iter, len(train_loader), loss, info['top1']))
+                    print('%s: training %d / %d: loss %.4f: top1 %.4f | acc %.4f | precision %.4f | recall %.4f | f1 %.4f'
+                          % (args.checkpoint, iter, len(train_loader), loss, info['top1'],
+                             info.get('acc', -1), info.get('precision', -1), info.get('recall', -1), info.get('f1', -1)))
 
                     fps = 10. / (time.time() - summary_t1)
                     info = summary(

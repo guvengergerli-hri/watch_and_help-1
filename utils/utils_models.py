@@ -141,9 +141,11 @@ class Logger():
         self.stats = AggregatedStats()
 
         save_path = os.path.join(self.save_dir, self.experiment_name)
-        root_dir = None
+        # Keep visualization outputs under the experiment save directory.
+        # The default Plotter root points to an internal /data path that is not writable here.
+        root_dir = self.save_dir
         if args.use_editor:
-            root_dir = '/Users/xavierpuig/Desktop/experiment_viz/'
+            root_dir = '/home/ggergerli/Documents/GitHub/experiment_viz'
         self.plot = Plotter(self.experiment_name, root_dir=root_dir)
         self.info_episodes = []
         try:
@@ -235,7 +237,11 @@ class Logger():
         with open(self.file_name_log, 'w+') as f:
             f.write(json.dumps(info_ep, indent=4))
         print("Dumped in {}".format(self.file_name_log))
-        self.plot.render()
+        # Rendering should never crash training.
+        try:
+            self.plot.render()
+        except Exception as e:
+            print("Warning: plot render failed, continuing training:", str(e))
 
     def save_model(self, j, actor_critic):
         save_path = os.path.join(self.save_dir, self.experiment_name)

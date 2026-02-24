@@ -1,10 +1,12 @@
-python src/predicate-train.py \
---gpu_id 0 \
+python watch/predicate-train.py \
+--gpu_id 2 \
 --model_lr_rate 3e-4 \
 --batch_size 8 \
---demo_hidden 512 \
+--demo_hidden 128 \
 --model_type lstmavg \
 --inputtype graphinput \
 --dropout 0 \
 --single 1 \
---checkpoints checkpoints/test
+--use_data_parallel 0 \
+--multi_classifier 1 \
+--checkpoint checkpoints/test/train_newplots_128_multiclass

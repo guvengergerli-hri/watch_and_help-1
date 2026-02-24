@@ -29,6 +29,66 @@ def _calculate_accuracy_predicate(logits, batch_target, max_possible_count=None,
     
     return correct_k
 
+
+def _calculate_classification_metrics(logits, batch_target):
+    """
+    Compute token-level multiclass metrics (in %) on flattened predictions.
+    """
+    with torch.no_grad():
+        pred = logits.argmax(1)
+        target = batch_target
+        num_classes = logits.size(1)
+        eps = 1e-9
+        prob = F.softmax(logits, dim=1)
+
+        accuracy = (pred == target).float().mean() * 100.0
+        confidence = prob.max(dim=1)[0].mean() * 100.0
+        pred_entropy = (-(prob * (prob + eps).log()).sum(dim=1)).mean()
+        pred_entropy_norm = pred_entropy / (np.log(float(num_classes)) + eps)
+
+        precision_sum = 0.0
+        recall_sum = 0.0
+        f1_sum = 0.0
+
+        for cls in range(num_classes):
+            pred_c = pred == cls
+            tgt_c = target == cls
+
+            tp = (pred_c & tgt_c).sum().float()
+            fp = (pred_c & (~tgt_c)).sum().float()
+            fn = ((~pred_c) & tgt_c).sum().float()
+
+            precision_c = tp / (tp + fp + eps)
+            recall_c = tp / (tp + fn + eps)
+            f1_c = 2.0 * precision_c * recall_c / (precision_c + recall_c + eps)
+
+            precision_sum += precision_c.item()
+            recall_sum += recall_c.item()
+            f1_sum += f1_c.item()
+
+        precision_macro = (precision_sum / float(num_classes)) * 100.0
+        recall_macro = (recall_sum / float(num_classes)) * 100.0
+        f1_macro = (f1_sum / float(num_classes)) * 100.0
+
+        # Collapse indicators: if one class dominates predictions, these spike.
+        pred_hist = torch.bincount(pred, minlength=num_classes).float()
+        top_class_frac = (pred_hist.max() / pred_hist.sum()) * 100.0
+        unique_pred_classes = float((pred_hist > 0).sum().item())
+        unique_pred_classes_frac = (unique_pred_classes / float(num_classes)) * 100.0
+
+        return {
+            "acc": accuracy.cpu().item(),
+            "precision": precision_macro,
+            "recall": recall_macro,
+            "f1": f1_macro,
+            "confidence": confidence.cpu().item(),
+            "pred_entropy": pred_entropy.cpu().item(),
+            "pred_entropy_norm": pred_entropy_norm.cpu().item(),
+            "top_class_frac": top_class_frac.cpu().item(),
+            "unique_pred_classes": unique_pred_classes,
+            "unique_pred_classes_frac": unique_pred_classes_frac,
+        }
+
 def _calculate_accuracy(
         action_correct,
         object_correct,
@@ -98,12 +158,23 @@ class PredicateClassifier(nn.Module):
         loss = F.cross_entropy(logits, batch_target)  
 
         top1 = _calculate_accuracy_predicate(logits, batch_target, self.max_possible_count)
+        metrics = _calculate_classification_metrics(logits, batch_target)
 
         with torch.no_grad():
             info = {
                 "prob": prob.cpu().numpy(),
                 "loss": loss.cpu().numpy(),
                 "top1": top1.cpu().numpy(),
+                "acc": metrics["acc"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "confidence": metrics["confidence"],
+                "pred_entropy": metrics["pred_entropy"],
+                "pred_entropy_norm": metrics["pred_entropy_norm"],
+                "top_class_frac": metrics["top_class_frac"],
+                "unique_pred_classes": metrics["unique_pred_classes"],
+                "unique_pred_classes_frac": metrics["unique_pred_classes_frac"],
                 "target": batch_target.cpu().numpy(),
                 "file_name": batch_file_name
             }
@@ -154,12 +225,23 @@ class PredicateClassifierMultiClassifier(nn.Module):
         loss = F.cross_entropy(logits, batch_target)  
 
         top1 = _calculate_accuracy_predicate(logits, batch_target, self.num_goal_predicates, multi_classifier=True)
+        metrics = _calculate_classification_metrics(logits, batch_target)
 
         with torch.no_grad():
             info = {
                 "prob": prob.cpu().numpy(),
                 "loss": loss.cpu().numpy(),
                 "top1": top1.cpu().numpy(),
+                "acc": metrics["acc"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "confidence": metrics["confidence"],
+                "pred_entropy": metrics["pred_entropy"],
+                "pred_entropy_norm": metrics["pred_entropy_norm"],
+                "top_class_frac": metrics["top_class_frac"],
+                "unique_pred_classes": metrics["unique_pred_classes"],
+                "unique_pred_classes_frac": metrics["unique_pred_classes_frac"],
                 "target": batch_target.cpu().numpy(),
                 "file_name": batch_file_name
             }
@@ -389,6 +471,4 @@ class GraphDemoEncoder(nn.Module):
         
         demo_emb = torch.stack(batch_demo_feat, 0)
         return demo_emb, batch_demo_feat
-
-
 

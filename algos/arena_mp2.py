@@ -34,7 +34,7 @@ class ArenaMP(object):
         return self.env.port_number
 
 
-    def reset(self, task_id=None):
+    def reset(self, task_id=None): # retries until reset returns observation
         ob = None
         while ob is None:
             ob = self.env.reset(task_id=task_id)
@@ -227,7 +227,7 @@ class ArenaMP(object):
                     # pdb.set_trace()
                     for agenti in range(len(self.agents)):
                         info_rollout['action'][agenti].append(agent_actions[agenti])
-                        info_rollout['obs'].append(agent_info[agenti]['obs'])
+                        info_rollout['obs'].append(agent_info[agenti].get('obs'))
 
                     info_rollout['action_tried'].append(agent_info[agent_id]['action_tried'])
                     if 'predicate' in agent_info[agent_id]:
@@ -371,14 +371,28 @@ class ArenaMP(object):
                       'subgoals': {0: [], 1: []},
                       'finished': None,
                       'init_unity_graph': self.env.init_graph,
+                      'graph_seq': [],
+                      'reward_seq': [],
                       'goals_finished': [],
                       'belief': {0: [], 1: []},
                       'belief_graph': {0: [], 1: []},
                       'obs': []}
+        try:
+            saved_info['graph_seq'].append(copy.deepcopy(self.env.get_graph()))
+        except Exception:
+            pass
+
+        if len(self.task_goal.get(0, {})) == 1:
+            single_goal_predicate, single_goal_count = list(self.task_goal[0].items())[0]
+            saved_info['single_goal_predicate'] = single_goal_predicate
+            saved_info['single_goal_count'] = single_goal_count
         success = False
         while True:
             (obs, reward, done, infos), actions, agent_info = self.step()
             success = infos['finished']
+            saved_info['reward_seq'].append(reward)
+            if 'graph' in infos:
+                saved_info['graph_seq'].append(copy.deepcopy(infos['graph']))
             if 'satisfied_goals' in infos:
                 saved_info['goals_finished'].append(infos['satisfied_goals'])
             for agent_id, action in actions.items():

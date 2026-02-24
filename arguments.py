@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import torch
 import pdb
@@ -128,6 +129,11 @@ def get_args():
         action='store_true',
         default=False,
         help='disables CUDA training')
+    parser.add_argument(
+        '--gpu-id',
+        type=int,
+        default=None,
+        help='physical GPU id to use (single GPU). If set, CUDA_VISIBLE_DEVICES is configured accordingly')
     parser.add_argument(
         '--use-proper-time-limits',
         action='store_true',
@@ -338,7 +344,14 @@ def get_args():
 
     args = parser.parse_args()
 
+    # Keep hybrid training on a single selected GPU, similar to Watch scripts.
+    # We set visibility before creating CUDA tensors/models.
+    if args.gpu_id is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
+
     args.cuda = not args.no_cuda and torch.cuda.is_available()
+    if args.cuda:
+        torch.cuda.set_device(0)
 
     assert args.algo in ['a2c', 'ppo', 'acktr']
     if args.recurrent_policy:

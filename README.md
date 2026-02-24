@@ -85,6 +85,18 @@ python gen_data/vh_init_gen_test.py
 
 It will use the tasks from the test split of the **Watch** phase to create a **Help** dataset.
 
+### Build a single-goal Alice dataset (VAE-ready)
+If you want demonstrations where Alice solves one goal predicate per demo and you want to keep full graph trajectories for downstream representation learning, run:
+
+```bash
+sh scripts/create_alice_single_goal_vae_dataset.sh
+```
+
+This pipeline:
+1. Builds a single-goal `env_task_set` (`gen_data/build_single_goal_dataset.py`).
+2. Runs Alice-only rollouts and logs per-step state graphs (`testing_agents/test_single_agent.py`).
+3. Exports rollouts into one VAE-ready dataset (`utils/export_alice_rollouts_for_vae.py`).
+
 
 
 ## Watch
@@ -100,6 +112,36 @@ To test the goal prediction model, run:
 ```bash
 sh scripts/test_watch.sh
 ```
+
+### Train a Watch Graph VAE
+To train an amortized LSTM-VAE directly on the Watch graph trajectories (same node feature format as the Watch encoder), run:
+
+```bash
+sh scripts/train_watch_vae.sh
+```
+
+This saves checkpoints under `checkpoints/watch_vae` with:
+1. A new run folder per launch: `checkpoints/watch_vae/<timestamp>_<experiment_slug>/`
+2. VAE model weights/config in that run folder (`watch_vae_best.pt`, `watch_vae_last.pt`, `best_model.pt`)
+3. Run metadata (`run_info.json`) and training history (`history.json`)
+4. Plot images under `<run>/plots`:
+   - `training_curves.png` (all train/val metrics)
+   - `latent_epoch_XXX.png` (per-dimension latent diagnostics: `mu`, `logvar`, `z`)
+5. Frozen teacher encoder exports in that run folder (`teacher_encoder_best.pt`, `teacher_encoder_last.pt`, `teacher_frozen.pt`)
+   - default exported scope is `backbone` (`frame_encoder` + `temporal_encoder`, plus action fusion modules if enabled)
+   - you can switch to `full_encoder` with `--teacher-scope full_encoder`
+6. TensorBoard events under `log_tb/watch_vae/<timestamp>_<experiment_slug>/` (isolated per experiment)
+
+You can also export a teacher encoder from an existing VAE checkpoint:
+
+```bash
+python watch/export_teacher_encoder.py \
+  --checkpoint checkpoints/watch_vae/<run>/watch_vae_best.pt \
+  --scope backbone
+```
+
+For online timestep-by-timestep inference (including multi-agent with one recurrent state per agent), use:
+- `watch/vae/online_inference.py` (`OnlineVAEInference`)
 
 ## Help
 We provide planning and learning-based agents for the Helping stage. The agents have partial observability in the environment, and plan according to a belief that updates with new observations.

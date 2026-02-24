@@ -50,7 +50,9 @@ import pdb
 import pickle
 import random
 import copy
-from agents import MCTS_agent, HRL_agent
+from agents import MCTS_agent
+from agents.HRL_agent_mcts import HRL_agent as HRLAgentMCTS
+from agents.HRL_agent_RL import HRL_agent_RL as HRLAgentRL
 from arguments import get_args
 from algos.arena_mp2 import ArenaMP
 from algos.a2c import A2C
@@ -206,7 +208,12 @@ if __name__ == '__main__':
         args_agent2 = {'agent_id': rl_agent_id, 'char_index': rl_agent_id - 1,
                        'args': args, 'graph_helper': graph_helper}
         args_agent2['seed'] = arena_id
-        return HRL_agent(**args_agent2)
+        if args.agent_type == 'hrl_mcts':
+            return HRLAgentMCTS(**args_agent2)
+        elif args.agent_type == 'rl':
+            return HRLAgentRL(**args_agent2)
+        else:
+            raise ValueError(f"Unsupported agent_type: {args.agent_type}")
 
 
 
@@ -216,7 +223,13 @@ if __name__ == '__main__':
     if args.use_alice:
         agents = [MCTS_agent_fn] + agents
     if args.num_processes > 1:
-        ArenaMP = ray.remote(ArenaMP) #, max_reconstructions=ray.ray_constants.INFINITE_RECONSTRUCTION)
+        # Ray workers need explicit GPU resources, otherwise Ray hides CUDA from them.
+        # Use fractional allocation so all rollout workers can share the selected single GPU.
+        if args.cuda:
+            gpu_per_worker = 1.0 / float(args.num_processes)
+            ArenaMP = ray.remote(num_gpus=gpu_per_worker)(ArenaMP)
+        else:
+            ArenaMP = ray.remote(ArenaMP)
         arenas = [ArenaMP.remote(args.max_number_steps, arena_id, env_fn, agents) for arena_id in range(args.num_processes)]
         a2c = A2C_MP(arenas, graph_helper, args)
     else:

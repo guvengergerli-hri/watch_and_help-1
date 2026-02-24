@@ -386,7 +386,7 @@ class HRL_agent:
         self.id2node = None
         self.hidden_state = self.init_hidden_state()
 
-        if torch.cuda.is_available():
+        if args.cuda:
             self.actor_critic.cuda()
 
         self.previous_belief_graph = None
@@ -445,9 +445,10 @@ class HRL_agent:
 
         masks = torch.ones(rnn_hxs[0].shape).type(rnn_hxs[0].type())
 
-        if torch.cuda.is_available():
-            rnn_hxs = (rnn_hxs[0].cuda(), rnn_hxs[1].cuda())
-            masks = masks.cuda()
+        if self.actor_critic.is_cuda():
+            model_device = next(self.actor_critic.parameters()).device
+            rnn_hxs = (rnn_hxs[0].to(model_device), rnn_hxs[1].to(model_device))
+            masks = masks.to(model_device)
         inputs, info = self.graph_helper.build_graph(observation,
                                                      include_edges=self.args.base_net == 'GNN',
                                                      action_space_ids=action_space_ids,

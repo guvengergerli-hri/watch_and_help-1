@@ -98,6 +98,72 @@ class UnityEnvironment(BaseUnityEnvironment):
         else:
             raise NotImplementedError
 
+    def _print_graph_debug_summary(self, name, graph):
+        if graph is None:
+            print("[GraphDebug] {}: <none>".format(name))
+            return
+        nodes = graph.get('nodes', [])
+        edges = graph.get('edges', [])
+        node_ids = set([node['id'] for node in nodes])
+        edge_ids = set([edge['to_id'] for edge in edges] + [edge['from_id'] for edge in edges])
+        dangling_ids = sorted(list(edge_ids - node_ids))
+        print("[GraphDebug] {}: nodes={} edges={} dangling_edge_refs={}".format(
+            name, len(nodes), len(edges), len(dangling_ids)))
+        if len(dangling_ids) > 0:
+            print("[GraphDebug] {} dangling ids sample: {}".format(name, dangling_ids[:20]))
+
+    def _debug_expand_scene_failure(self, base_graph, updated_graph, msg):
+        print("[GraphDebug] expand_scene failed for env_id={} task_id={} task_name={}".format(
+            self.env_id, self.task_id, self.task_name))
+        self._print_graph_debug_summary("base_scene_graph", base_graph)
+        self._print_graph_debug_summary("updated_task_graph", updated_graph)
+        print("[GraphDebug] expand_scene message: {}".format(msg))
+
+        base_node_lookup = {node['id']: node for node in base_graph.get('nodes', [])}
+        updated_node_lookup = {node['id']: node for node in updated_graph.get('nodes', [])}
+        shared_ids = set(base_node_lookup.keys()) & set(updated_node_lookup.keys())
+        class_mismatches = []
+        for node_id in shared_ids:
+            base_class = base_node_lookup[node_id].get('class_name')
+            updated_class = updated_node_lookup[node_id].get('class_name')
+            if base_class != updated_class:
+                class_mismatches.append((node_id, base_class, updated_class))
+        if len(class_mismatches) > 0:
+            print("[GraphDebug] shared-id class mismatches count={}".format(len(class_mismatches)))
+            for node_id, base_class, updated_class in class_mismatches[:20]:
+                print("[GraphDebug]   id={} base_class={} updated_class={}".format(
+                    node_id, base_class, updated_class))
+
+        if not isinstance(msg, dict):
+            return
+        unaligned_ids = msg.get('unaligned_ids', [])
+        if len(unaligned_ids) == 0:
+            return
+
+        for bad_id in unaligned_ids:
+            print("[GraphDebug] unaligned_id={}".format(bad_id))
+            base_node = base_node_lookup.get(bad_id)
+            if base_node is None:
+                print("[GraphDebug]   base scene has no node with this id")
+            else:
+                print("[GraphDebug]   base node class={} category={} states={}".format(
+                    base_node.get('class_name'), base_node.get('category'), base_node.get('states', [])))
+
+            node = updated_node_lookup.get(bad_id)
+            if node is None:
+                print("[GraphDebug]   node with this id is missing from updated_task_graph")
+            else:
+                print("[GraphDebug]   node class={} category={} states={}".format(
+                    node.get('class_name'), node.get('category'), node.get('states', [])))
+            related_edges = [
+                edge for edge in updated_graph.get('edges', [])
+                if edge.get('from_id') == bad_id or edge.get('to_id') == bad_id
+            ]
+            print("[GraphDebug]   related edges count={}".format(len(related_edges)))
+            for edge in related_edges[:10]:
+                print("[GraphDebug]     edge: {} --{}--> {}".format(
+                    edge.get('from_id'), edge.get('relation_type'), edge.get('to_id')))
+
     def reset(self, environment_graph=None, task_id=None):
 
         # Make sure that characters are out of graph, and ids are ok
@@ -125,13 +191,13 @@ class UnityEnvironment(BaseUnityEnvironment):
             print("Fast reset")
             self.comm.fast_reset()
         else:
-            self.comm.reset(self.env_id)
+            self.comm.reset(self.env_id) # reset apartment to a base scene essentially
 
-        s,g = self.comm.environment_graph()
+        s,g = self.comm.environment_graph() # reads the base scene graph
         edge_ids = set([edge['to_id'] for edge in g['edges']] + [edge['from_id'] for edge in g['edges']])
         node_ids = set([node['id'] for node in g['nodes']])
         if len(edge_ids - node_ids) > 0:
-            pdb.set_trace()
+            print("Warning: environment graph has dangling edge references")
 
 
         if self.env_id not in self.max_ids.keys():
@@ -149,13 +215,13 @@ class UnityEnvironment(BaseUnityEnvironment):
             updated_graph = self.init_graph
             s, g = self.comm.environment_graph()
             updated_graph = utils.separate_new_ids_graph(updated_graph, max_id)
-            success, m = self.comm.expand_scene(updated_graph)
+            success, m = self.comm.expand_scene(updated_graph) # here we try to apply into the task graph.
         
 
-        if not success:
-            ipdb.set_trace()
+        if not success: # if failed returns None so it keeps trying.
             print("Error expanding scene")
-            ipdb.set_trace()
+            print(m)
+            self._debug_expand_scene_failure(g, updated_graph, m)
             return None
             
         
@@ -191,16 +257,13 @@ class UnityEnvironment(BaseUnityEnvironment):
             if self.recording_options['recording']:
                 success, message = self.comm.render_script(script_list,
                                                            recording=True,
-                                                           gen_vid=False,
                                                            skip_animation=False,
                                                            camera_mode=self.recording_options['cameras'],
                                                            file_name_prefix='task_{}'.format(self.task_id),
-                                                           image_synthesis=self.recording_optios['modality'])
+                                                           image_synthesis=self.recording_options['modality'])
             else:
                 success, message = self.comm.render_script(script_list,
                                                            recording=False,
-                                                           image_synthesis=[],
-                                                           gen_vid=False,
                                                            skip_animation=True)
             if not success:
                 print("NO SUCCESS")
@@ -225,9 +288,23 @@ class UnityEnvironment(BaseUnityEnvironment):
             done = True
         return obs, reward, done, info
 
+    def get_action_space(self):
+        dict_action_space = {}
+        for agent_id in range(self.num_agents):
+            obs_type = self.observation_types[agent_id]
+            if obs_type not in ['mcts', 'partial', 'full']:
+                raise NotImplementedError
+
+            # For action-space construction, mcts/partial both use the visible graph.
+            visible_graph = self.get_observation(agent_id, 'mcts' if obs_type != 'full' else 'full')
+            dict_action_space[agent_id] = [node['id'] for node in visible_graph['nodes']]
+        return dict_action_space
+
 
     def get_observation(self, agent_id, obs_type, info={}):
-        if obs_type == 'partial':
+        # Some training scripts request "mcts" observations for Alice.
+        # In this wrapper, MCTS uses the same visible-graph observation as "partial".
+        if obs_type in ['partial', 'mcts']:
             # agent 0 has id (0 + 1)
             curr_graph = self.get_graph()
             curr_graph = utils.inside_not_trans(curr_graph)

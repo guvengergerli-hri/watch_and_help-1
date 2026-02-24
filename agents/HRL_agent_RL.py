@@ -395,7 +395,7 @@ class HRL_agent_RL:
         self.hidden_state_low_level_put = self.init_hidden_state()
         self.put_policy = False
 
-        if torch.cuda.is_available():
+        if args.cuda:
             self.actor_critic.cuda()
             self.actor_critic_low_level.cuda()
             self.actor_critic_low_level_put.cuda()
@@ -430,7 +430,7 @@ class HRL_agent_RL:
 
     def reset(self, observed_graph, gt_graph, task_goal={}, seed=0):
         self.action_count = 0
-        self.belief = Belief.Belief(gt_graph, agent_id=self.agent_id, seed=seed)
+        self.belief = belief.Belief(gt_graph, agent_id=self.agent_id, seed=seed)
         self.belief.sample_from_belief()
         graph_belief = self.sample_belief(observed_graph)  # self.env.get_observations(char_index=self.char_index))
         self.sim_env.reset(graph_belief, task_goal)
@@ -463,11 +463,12 @@ class HRL_agent_RL:
 
         masks = torch.ones(rnn_hxs[0].shape).type(rnn_hxs[0].type())
 
-        if torch.cuda.is_available():
-            rnn_hxs = (rnn_hxs[0].cuda(), rnn_hxs[1].cuda())
-            rnn_hxs_low_level = (rnn_hxs_low_level[0].cuda(), rnn_hxs_low_level[1].cuda())
-            rnn_hxs_low_level_put = (rnn_hxs_low_level_put[0].cuda(), rnn_hxs_low_level_put[1].cuda())
-            masks = masks.cuda()
+        if self.actor_critic.is_cuda():
+            model_device = next(self.actor_critic.parameters()).device
+            rnn_hxs = (rnn_hxs[0].to(model_device), rnn_hxs[1].to(model_device))
+            rnn_hxs_low_level = (rnn_hxs_low_level[0].to(model_device), rnn_hxs_low_level[1].to(model_device))
+            rnn_hxs_low_level_put = (rnn_hxs_low_level_put[0].to(model_device), rnn_hxs_low_level_put[1].to(model_device))
+            masks = masks.to(model_device)
         inputs, info = self.graph_helper.build_graph(observation,
                                                      include_edges=self.args.base_net == 'GNN',
                                                      action_space_ids=action_space_ids,
@@ -597,6 +598,15 @@ class HRL_agent_RL:
                 target_obj_class_pred = [self.graph_helper.object_dict.get_id('no_obj')] * 6
                 target_loc_class_pred = [self.graph_helper.object_dict.get_id('no_obj')] * 6
                 mask_goal_pred_pred = [0.0] * 6
+                obj_class_id = self.graph_helper.object_dict.get_id('no_obj')
+
+                def _safe_class_id(token):
+                    if token is None:
+                        return int(self.graph_helper.object_dict.get_id('no_obj'))
+                    try:
+                        return int(self.graph_helper.object_dict.get_id(token))
+                    except Exception:
+                        return int(self.graph_helper.object_dict.get_id('no_obj'))
 
                 for predicate, info in pred_goal_spec.items():
                     count, required, reward = info
@@ -607,13 +617,26 @@ class HRL_agent_RL:
                     #     continue
 
                     elements = predicate.split('_')
-                    # print('PRED_OB', elements[1])
-                    obj_class_id = int(self.graph_helper.object_dict.get_id(elements[1]))
-                    if elements[2].isdigit():
-                        loc_class_id = int(self.graph_helper.object_dict.get_id(self.id2node[int(elements[2])]['class_name']))
+                    pred_type = elements[0] if len(elements) > 0 else ''
+
+                    # Handle both 3-part predicates (e.g., put_apple_fridge)
+                    # and 2-part predicates (e.g., open_fridge) safely.
+                    if pred_type == 'open' and len(elements) >= 2:
+                        obj_token = 'no_obj'
+                        loc_token = elements[1]
                     else:
-                        loc_class_id = int(self.graph_helper.object_dict.get_id(elements[2]))
+                        obj_token = elements[1] if len(elements) >= 2 else 'no_obj'
+                        loc_token = elements[2] if len(elements) >= 3 else 'no_obj'
+
+                    obj_class_id = _safe_class_id(obj_token)
+                    if isinstance(loc_token, str) and loc_token.isdigit() and int(loc_token) in self.id2node:
+                        loc_class_id = _safe_class_id(self.id2node[int(loc_token)]['class_name'])
+                    else:
+                        loc_class_id = _safe_class_id(loc_token)
+
                     for _ in range(count):
+                        if pre_id >= len(target_obj_class_pred):
+                            break
                         target_obj_class_pred[pre_id] = obj_class_id
                         target_loc_class_pred[pre_id] = loc_class_id
                         mask_goal_pred_pred[pre_id] = 1.0

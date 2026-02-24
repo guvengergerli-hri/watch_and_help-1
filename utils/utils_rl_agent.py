@@ -326,7 +326,13 @@ def can_perform_action(action, o1, o1_id, agent_id, graph, graph_helper=None, te
     obj1_str = ''
     id2node = {node['id']: node for node in graph['nodes']}
     num_args = 0 if o1 is None else 1
-    grabbed_objects = [edge['to_id'] for edge in graph['edges'] if edge['from_id'] == agent_id and edge['relation_type'] in ['HOLDS_RH', 'HOLD_LH']]
+    # Track any object already held by the agent (RH/LH).
+    # Use prefix match to avoid brittle string mismatches.
+    grabbed_objects = [
+        edge['to_id']
+        for edge in graph['edges']
+        if edge['from_id'] == agent_id and str(edge.get('relation_type', '')).startswith('HOLDS')
+    ]
     if num_args != args_per_action(action):
         return None
     

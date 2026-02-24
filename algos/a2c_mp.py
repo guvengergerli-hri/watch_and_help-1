@@ -28,7 +28,7 @@ class A2C:
 
         self.args = args
         num_actions = graph_helper.num_actions
-        if args.agent_type == 'hrl_mcts':
+        if args.agent_type in ['hrl_mcts', 'rl']:
             self.objects1, self.objects2 = [], []
             # all objects that can be grabbed
             grabbed_obj = graph_helper.object_dict_types["objects_grab"]
@@ -79,7 +79,7 @@ class A2C:
                 self.rl_agent_id = 1
             else:
                 self.rl_agent_id = 0
-            if args.agent_type == 'hrl_mcts':
+            if args.agent_type in ['hrl_mcts', 'rl']:
                 self.actor_critic = actor_critic_hl_mcts.ActorCritic(action_space, base_name=args.base_net,
                                                                      base_kwargs=base_kwargs)
                 self.actor_critic.base.main.main.bad_transformer = False
