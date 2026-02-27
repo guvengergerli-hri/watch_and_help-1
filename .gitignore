@@ -34,3 +34,5 @@ visualization/*.mp4
 /trained_models_phase2
 /log_tb_phase2
 *.gz
+/outputs
+Player.log

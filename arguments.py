@@ -341,6 +341,44 @@ def get_args():
     parser.add_argument('--c_loss_close', type=float, default=0., help='coefficient auxiliary loss goal close')
     parser.add_argument('--c_loss_goal', type=float, default=0., help='coefficient auxiliary loss goal obj')
 
+    # Optional visualization hooks for test/eval scripts.
+    parser.add_argument('--viz-eval-enable', action='store_true', default=False,
+                        help='enable selected eval episode visualization during test loops')
+    parser.add_argument('--viz-mode', type=str, default='both', choices=['unity', 'topdown', 'both'],
+                        help='visualization outputs to generate when viz-eval-enable is on')
+    parser.add_argument('--viz-episode-index', type=int, default=0,
+                        help='episode index (after task-set filtering) to visualize')
+    parser.add_argument('--viz-try-index', type=int, default=0,
+                        help='eval try index to visualize')
+    parser.add_argument('--viz-out-root', type=str, default='outputs/test_hybrid_viz',
+                        help='root directory for eval visualization artifacts')
+    parser.add_argument('--viz-port-offset', type=int, default=100,
+                        help='Unity port offset used for visualization subprocess to avoid port conflicts')
+    parser.add_argument('--viz-x-display', type=str, default=None,
+                        help='X display for visualization Unity executable (e.g. 1)')
+    parser.add_argument('--viz-no-graphics', action='store_true', default=False,
+                        help='run visualization Unity capture with no_graphics')
+    parser.add_argument('--viz-fps', type=int, default=5,
+                        help='fps for generated visualization videos')
+    parser.add_argument('--viz-dpi', type=int, default=120,
+                        help='dpi for topdown rendered frames')
+    parser.add_argument('--viz-max-steps', type=int, default=None,
+                        help='optional cap for rendered visualization steps')
+    parser.add_argument('--viz-skip-video', action='store_true', default=False,
+                        help='skip ffmpeg video export; keep frames + metadata only')
+    parser.add_argument('--viz-capture-char-index', type=int, default=None,
+                        help='optional character index for Unity camera capture')
+    parser.add_argument('--viz-camera-index-within-char', type=int, default=1,
+                        help='camera slot within character for Unity capture')
+    parser.add_argument('--viz-capture-phase', type=str, default='before', choices=['before', 'after'],
+                        help='capture Unity frame before or after executing action')
+    parser.add_argument('--viz-processing-time-limit', type=int, default=20,
+                        help='Unity action processing time limit for visualization replay')
+    parser.add_argument('--viz-time-scale', type=float, default=10.0,
+                        help='Unity replay time scale for visualization capture')
+    parser.add_argument('--viz-deterministic-policy', action='store_true', default=False,
+                        help='use deterministic policy when re-running selected episode for Unity visualization')
+
 
     args = parser.parse_args()
 

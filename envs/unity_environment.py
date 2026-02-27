@@ -164,6 +164,43 @@ class UnityEnvironment(BaseUnityEnvironment):
                 print("[GraphDebug]     edge: {} --{}--> {}".format(
                     edge.get('from_id'), edge.get('relation_type'), edge.get('to_id')))
 
+    def _align_unaligned_node_classes(self, base_graph, updated_graph, msg):
+        if not isinstance(msg, dict):
+            return updated_graph, 0
+        unaligned_ids = msg.get('unaligned_ids', [])
+        if not isinstance(unaligned_ids, list) or len(unaligned_ids) == 0:
+            return updated_graph, 0
+
+        base_node_lookup = {node['id']: node for node in base_graph.get('nodes', [])}
+        updated_graph_fixed = copy.deepcopy(updated_graph)
+        updated_node_lookup = {node['id']: node for node in updated_graph_fixed.get('nodes', [])}
+
+        fixed_count = 0
+        for bad_id in unaligned_ids:
+            if bad_id not in base_node_lookup or bad_id not in updated_node_lookup:
+                continue
+            base_node = base_node_lookup[bad_id]
+            updated_node = updated_node_lookup[bad_id]
+
+            base_class = base_node.get('class_name')
+            updated_class = updated_node.get('class_name')
+            if base_class == updated_class:
+                continue
+
+            print(
+                "[GraphDebug] auto-align node id={} class {} -> {} (retrying expand_scene)".format(
+                    bad_id, updated_class, base_class
+                )
+            )
+            updated_node['class_name'] = base_class
+            if 'category' in base_node:
+                updated_node['category'] = base_node.get('category')
+            if 'properties' in base_node:
+                updated_node['properties'] = copy.deepcopy(base_node.get('properties', []))
+            fixed_count += 1
+
+        return updated_graph_fixed, fixed_count
+
     def reset(self, environment_graph=None, task_id=None):
 
         # Make sure that characters are out of graph, and ids are ok
@@ -219,10 +256,23 @@ class UnityEnvironment(BaseUnityEnvironment):
         
 
         if not success: # if failed returns None so it keeps trying.
-            print("Error expanding scene")
-            print(m)
-            self._debug_expand_scene_failure(g, updated_graph, m)
-            return None
+            fixed_graph, fixed_count = self._align_unaligned_node_classes(g, updated_graph, m)
+            if fixed_count > 0:
+                success_retry, m_retry = self.comm.expand_scene(fixed_graph)
+                if success_retry:
+                    print("[GraphDebug] expand_scene retry succeeded after {} class-id alignment fix(es)".format(fixed_count))
+                    success = True
+                    updated_graph = fixed_graph
+                else:
+                    print("Error expanding scene")
+                    print(m_retry)
+                    self._debug_expand_scene_failure(g, fixed_graph, m_retry)
+                    return None
+            else:
+                print("Error expanding scene")
+                print(m)
+                self._debug_expand_scene_failure(g, updated_graph, m)
+                return None
             
         
         self.offset_cameras = self.comm.camera_count()[1]

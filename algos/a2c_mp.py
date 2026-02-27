@@ -15,6 +15,44 @@ from models import actor_critic, actor_critic_hl_mcts
 from gym import spaces
 import atexit
 
+
+def _install_torch_pickle_compat() -> None:
+    # Older torch checkpoints may reference private classes such as
+    # torch.nn.modules.linear._LinearWithBias. Newer torch versions removed it.
+    linear_mod = torch.nn.modules.linear
+    if not hasattr(linear_mod, "_LinearWithBias"):
+        class _LinearWithBias(torch.nn.Linear):  # type: ignore[valid-type,misc]
+            pass
+
+        linear_mod._LinearWithBias = _LinearWithBias  # type: ignore[attr-defined]
+
+
+def _torch_load_compat(path, map_location=None):
+    try:
+        if map_location is None:
+            return torch.load(path)
+        return torch.load(path, map_location=map_location)
+    except AttributeError as e:
+        # Backward-compat fallback for old serialized internals.
+        if "_LinearWithBias" not in str(e):
+            raise
+        _install_torch_pickle_compat()
+        if map_location is None:
+            return torch.load(path)
+        return torch.load(path, map_location=map_location)
+
+
+def _state_dict_from_blob(blob):
+    if isinstance(blob, torch.nn.Module):
+        return blob.state_dict()
+    if isinstance(blob, dict):
+        state_dict = blob.get("state_dict")
+        if isinstance(state_dict, dict):
+            return state_dict
+        return blob
+    raise TypeError("Unsupported checkpoint payload type: {}".format(type(blob).__name__))
+
+
 class A2C:
     def __init__(self, arenas, graph_helper, args):
         self.arenas = arenas
@@ -145,19 +183,23 @@ class A2C:
         return rewards, info_rollout
 
     def load_model(self, model_path, model_path_lowlevel=None):
-        model = torch.load(model_path)[0]
-        # ipdb.set_trace()
-        # ipdb.set_trace()
-        self.actor_critic.load_state_dict(model.state_dict())
+        loaded = _torch_load_compat(model_path, map_location=self.device)
+        model_blob = loaded[0] if isinstance(loaded, (list, tuple)) else loaded
+        model_state_dict = _state_dict_from_blob(model_blob)
+        self.actor_critic.load_state_dict(model_state_dict)
         if self.actor_critic_low_level is not None and model_path_lowlevel is not None:
             
             torch.nn.Module.dump_patches = True
-            model_low_level = torch.load(model_path_lowlevel)
+            model_low_level = _torch_load_compat(model_path_lowlevel, map_location=self.device)
+            if not isinstance(model_low_level, (list, tuple)) or len(model_low_level) < 2:
+                raise ValueError(
+                    "Expected low-level checkpoint with two entries, got: {}".format(type(model_low_level).__name__)
+                )
 
-            # ipdb.set_trace()
-            # ipdb.set_trace()
-            self.actor_critic_low_level.load_state_dict(model_low_level[0].state_dict())
-            self.actor_critic_low_level_put.load_state_dict(model_low_level[1].state_dict())
+            ll_state_dict = _state_dict_from_blob(model_low_level[0])
+            ll_put_state_dict = _state_dict_from_blob(model_low_level[1])
+            self.actor_critic_low_level.load_state_dict(ll_state_dict)
+            self.actor_critic_low_level_put.load_state_dict(ll_put_state_dict)
 
     def eval(self, episode_id, goals=None):
         self.actor_critic.eval()
