@@ -60,7 +60,8 @@ class A2C:
             'hidden_size': args.hidden_size,
             'max_nodes': args.max_num_objects,
             'num_classes': graph_helper.num_classes,
-            'num_states': graph_helper.num_states
+            'num_states': graph_helper.num_states,
+            'goal_cond_mode': args.goal_cond_mode,
 
         }
 
@@ -260,6 +261,25 @@ class A2C:
             obs_space = []
             successes = []
             num_steps = []
+            collab_metric_names = [
+                'alice_action_rate',
+                'bob_action_rate',
+                'joint_action_rate',
+                'bob_action_share',
+                'progress_total',
+                'progress_rate',
+                'progress_at_25',
+                'progress_at_50',
+                'progress_at_100',
+                'time_to_first_progress',
+                'alice_progress_credit_frac',
+                'bob_progress_credit_frac',
+                'shared_progress_credit_frac',
+                'alice_progress_credit_count',
+                'bob_progress_credit_count',
+                'shared_progress_credit_count',
+            ]
+            collab_metrics = {name: [] for name in collab_metric_names}
             episode_rewards = [c_r_all_roll[0] for c_r_all_roll in c_r_all]
 
 
@@ -268,14 +288,25 @@ class A2C:
                 action_space.append(info_rollout_ep['action_space'])
                 obs_space.append(info_rollout_ep['observation_space'])
                 successes.append(info_rollout_ep['success'])
+                for metric_name in collab_metric_names:
+                    if metric_name in info_rollout_ep:
+                        collab_metrics[metric_name].append(info_rollout_ep[metric_name])
+            collab_summary = {
+                metric_name: float(np.mean(values))
+                for metric_name, values in collab_metrics.items()
+                if len(values) > 0
+            }
 
             total_num_steps += np.sum(num_steps)
             fps = total_num_steps*1.0/(end_time-start_time)
-            print("episode: #{} steps: {} reward: {} finished: {}/{} FPS {} #Objects {} #Objects actions {}".format(
+            print("episode: #{} steps: {} reward: {} finished: {}/{} FPS {} #Objects {} #Objects actions {} BobAct {} BobCredit {} Prog {}".format(
                 episode_id, np.mean(num_steps),
                 np.mean(episode_rewards),
                 np.sum(successes), len(episode_rewards),
-                fps, np.mean(obs_space), np.mean(action_space)))
+                fps, np.mean(obs_space), np.mean(action_space),
+                collab_summary.get('bob_action_rate', 0.0),
+                collab_summary.get('bob_progress_credit_frac', 0.0),
+                collab_summary.get('progress_total', 0.0)))
 
             if episode_id % self.args.log_interval == 0:
 
@@ -342,6 +373,7 @@ class A2C:
                                     np.mean([np.mean(info_rollout[it]['entropy'][1]) for it in range(len(info_rollout))]))
                     # pdb.set_trace()
                     info_aux = {}
+                    info_aux.update(collab_summary)
 
                     if 'pred_close' in info_rollout[0].keys() and \
                             len(info_rollout[0]['pred_close']) > 0:

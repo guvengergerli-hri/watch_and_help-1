@@ -170,7 +170,7 @@ class Logger():
         args = self.args
         info_mcts = 'stepmcts.{}-lep.{}-teleport.{}-beliefgraph-forcepred'.format(args.num_steps_mcts, args.max_episode_length, args.teleport)
         experiment_name = 'env.{}/task.{}-numproc.{}-obstype.{}-sim.{}/taskset.{}/agent.{}_alice.{}/'\
-                          'mode.{}-algo.{}-base.{}-gamma.{}-cclose.{}-cgoal.{}-lr{}-bs.{}{}_goodTF/{}'.format(
+                          'mode.{}-algo.{}-base.{}-goalcond.{}-gamma.{}-cclose.{}-cgoal.{}-lr{}-bs.{}{}_goodTF/{}'.format(
             args.env_name,
             args.task_type,
             args.num_processes,
@@ -182,6 +182,7 @@ class Logger():
             args.train_mode,
             args.algo,
             args.base_net,
+            args.goal_cond_mode,
             args.gamma,
             args.c_loss_close,
             args.c_loss_goal,
@@ -208,6 +209,32 @@ class Logger():
 
                 self.tensorboard_writer.add_scalar("losses/loss_close", np.mean(info_aux['loss_close']), total_num_steps)
                 self.tensorboard_writer.add_scalar("losses/loss_goal", np.mean(info_aux['loss_goal']), total_num_steps)
+
+            collab_metric_names = [
+                'alice_action_rate',
+                'bob_action_rate',
+                'joint_action_rate',
+                'bob_action_share',
+                'progress_total',
+                'progress_rate',
+                'progress_at_25',
+                'progress_at_50',
+                'progress_at_100',
+                'time_to_first_progress',
+                'alice_progress_credit_frac',
+                'bob_progress_credit_frac',
+                'shared_progress_credit_frac',
+                'alice_progress_credit_count',
+                'bob_progress_credit_count',
+                'shared_progress_credit_count',
+            ]
+            for metric_name in collab_metric_names:
+                if metric_name in info_aux:
+                    self.tensorboard_writer.add_scalar(
+                        "collab/{}".format(metric_name),
+                        float(info_aux[metric_name]),
+                        total_num_steps,
+                    )
             #
             # self.tensorboard_writer.add_scalar("losses/loss_close", np.mean(info_aux['loss_close']), total_num_steps)
             # self.tensorboard_writer.add_scalar("losses/loss_goal", np.mean(info_aux['loss_goal']), total_num_steps)

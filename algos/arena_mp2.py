@@ -185,6 +185,32 @@ class ArenaMP(object):
         prev_reward = 0
         init_step_agent_info = {}
         local_rollout_actions = []
+        def _count_satisfied_predicates(satisfied_goals):
+            if not isinstance(satisfied_goals, dict):
+                return 0
+            total = 0
+            for val in satisfied_goals.values():
+                if isinstance(val, (list, tuple, set)):
+                    total += len(val)
+                elif isinstance(val, (int, float, np.integer, np.floating)):
+                    total += max(0, int(val))
+            return int(total)
+
+        # Collaboration/progress counters (episode-level, then logged to tensorboard).
+        alice_idx = 0
+        bob_idx = 1 if self.num_agents > 1 else None
+        alice_action_steps = 0
+        bob_action_steps = 0
+        joint_action_steps = 0
+        progress_prev = 0
+        progress_total = 0
+        progress_at_25 = None
+        progress_at_50 = None
+        progress_at_100 = None
+        first_progress_step = 0
+        credit_alice = 0.0
+        credit_bob = 0.0
+        credit_shared = 0.0
         if not is_train:
             pbar = tqdm(total=self.max_episode_length)
         while not done and nb_steps < self.max_episode_length and agent_steps < self.max_number_steps:
@@ -197,6 +223,41 @@ class ArenaMP(object):
                 print('----')
             # print(agent_actions[agent_id], reward)
             local_rollout_actions.append(agent_actions[0])
+
+            # Online collaboration/action-share stats
+            alice_action = agent_actions.get(alice_idx, None)
+            bob_action = agent_actions.get(bob_idx, None) if bob_idx is not None else None
+            alice_acted = alice_action is not None
+            bob_acted = bob_action is not None
+            if alice_acted:
+                alice_action_steps += 1
+            if bob_acted:
+                bob_action_steps += 1
+            if alice_acted and bob_acted:
+                joint_action_steps += 1
+
+            # Online progress stats from satisfied predicates.
+            progress_curr = _count_satisfied_predicates(env_info.get('satisfied_goals', {}))
+            progress_total = progress_curr
+            delta_progress = max(0, progress_curr - progress_prev)
+            if delta_progress > 0:
+                if alice_acted and not bob_acted:
+                    credit_alice += float(delta_progress)
+                elif bob_acted and not alice_acted:
+                    credit_bob += float(delta_progress)
+                elif alice_acted and bob_acted:
+                    credit_shared += float(delta_progress)
+            if first_progress_step == 0 and progress_curr > 0:
+                first_progress_step = int(nb_steps + 1)
+            progress_prev = progress_curr
+            step_idx_1 = int(nb_steps + 1)
+            if progress_at_25 is None and step_idx_1 >= 25:
+                progress_at_25 = int(progress_curr)
+            if progress_at_50 is None and step_idx_1 >= 50:
+                progress_at_50 = int(progress_curr)
+            if progress_at_100 is None and step_idx_1 >= 100:
+                progress_at_100 = int(progress_curr)
+
             if not is_train:
                 pbar.update(1)
             if logging:
@@ -301,6 +362,30 @@ class ArenaMP(object):
         info_rollout['action_space'] = np.mean(action_space)
         info_rollout['t_reset'] = t_reset
         info_rollout['t_steps'] = t_steps
+        if progress_at_25 is None:
+            progress_at_25 = int(progress_total)
+        if progress_at_50 is None:
+            progress_at_50 = int(progress_total)
+        if progress_at_100 is None:
+            progress_at_100 = int(progress_total)
+        total_action_steps = alice_action_steps + bob_action_steps
+        total_credit = credit_alice + credit_bob + credit_shared
+        info_rollout['alice_action_rate'] = float(alice_action_steps) / max(1, nb_steps)
+        info_rollout['bob_action_rate'] = float(bob_action_steps) / max(1, nb_steps)
+        info_rollout['joint_action_rate'] = float(joint_action_steps) / max(1, nb_steps)
+        info_rollout['bob_action_share'] = float(bob_action_steps) / max(1, total_action_steps)
+        info_rollout['progress_total'] = float(progress_total)
+        info_rollout['progress_rate'] = float(progress_total) / max(1, nb_steps)
+        info_rollout['progress_at_25'] = float(progress_at_25)
+        info_rollout['progress_at_50'] = float(progress_at_50)
+        info_rollout['progress_at_100'] = float(progress_at_100)
+        info_rollout['time_to_first_progress'] = float(first_progress_step if first_progress_step > 0 else (nb_steps + 1))
+        info_rollout['alice_progress_credit_frac'] = float(credit_alice) / max(1e-9, total_credit)
+        info_rollout['bob_progress_credit_frac'] = float(credit_bob) / max(1e-9, total_credit)
+        info_rollout['shared_progress_credit_frac'] = float(credit_shared) / max(1e-9, total_credit)
+        info_rollout['alice_progress_credit_count'] = float(credit_alice)
+        info_rollout['bob_progress_credit_count'] = float(credit_bob)
+        info_rollout['shared_progress_credit_count'] = float(credit_shared)
 
         # pdb.set_trace()
         for agent_index in agent_info.keys():

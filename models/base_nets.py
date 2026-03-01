@@ -267,7 +267,7 @@ class GoalEncoder(nn.Module):
 
 
 class GoalAttentionModel(NNBase):
-    def __init__(self, recurrent=False, hidden_size=128, num_classes=100, node_encoder=None, context_type='avg'):
+    def __init__(self, recurrent=False, hidden_size=128, num_classes=100, node_encoder=None, context_type='avg', goal_cond_mode='gt'):
         super(GoalAttentionModel, self).__init__(recurrent, hidden_size, hidden_size)
 
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
@@ -283,6 +283,7 @@ class GoalAttentionModel(NNBase):
         self.goal_encoder = GoalEncoder(num_classes, 2 * hidden_size)#, obj_class_encoder=self.main.object_class_encoding)
         # self.goal_encoder = nn.EmbeddingBag(num_classes, hidden_size, mode='sum')
         self.context_type = context_type
+        self.goal_cond_mode = goal_cond_mode
 
         self.fc_att_action = self.mlp2l(hidden_size * 2, hidden_size)
         self.fc_att_object = self.mlp2l(hidden_size * 2, hidden_size)
@@ -308,20 +309,23 @@ class GoalAttentionModel(NNBase):
             context_vec = features_obj[:, 0, :]
 
 
-        # Goal embedding
-        obj_class_name = inputs['target_obj_class']  # [:, 0].long()
-        loc_class_name = inputs['target_loc_class']  # [:, 0].long()
-        mask_goal = inputs['mask_goal_pred']
+        if self.goal_cond_mode == 'gt':
+            # Goal embedding
+            obj_class_name = inputs['target_obj_class']  # [:, 0].long()
+            loc_class_name = inputs['target_loc_class']  # [:, 0].long()
+            mask_goal = inputs['mask_goal_pred']
 
-        goal_encoding = self.goal_encoder(obj_class_name, loc_class_name, mask_goal)
+            goal_encoding = self.goal_encoder(obj_class_name, loc_class_name, mask_goal)
 
-        # goal_encoding_obj = self.goal_encoder(obj_class_name).squeeze(1)
-        # goal_encoding_loc = self.goal_encoder(loc_class_name).squeeze(1)
-        # goal_encoding = torch.cat([goal_encoding_obj, goal_encoding_loc], dim=-1)
-
-
-        goal_mask_action = torch.sigmoid(self.fc_att_action(goal_encoding))
-        goal_mask_object = torch.sigmoid(self.fc_att_object(goal_encoding))
+            # goal_encoding_obj = self.goal_encoder(obj_class_name).squeeze(1)
+            # goal_encoding_loc = self.goal_encoder(loc_class_name).squeeze(1)
+            # goal_encoding = torch.cat([goal_encoding_obj, goal_encoding_loc], dim=-1)
+            goal_mask_action = torch.sigmoid(self.fc_att_action(goal_encoding))
+            goal_mask_object = torch.sigmoid(self.fc_att_object(goal_encoding))
+        else:
+            # No-goal ablation: keep architecture unchanged but remove goal modulation.
+            goal_mask_action = torch.ones_like(context_vec)
+            goal_mask_object = torch.ones_like(context_vec)
 
        # h' = GA . h [bs, h]
         context_goal = goal_mask_action * context_vec
@@ -419,6 +423,5 @@ class ObjNameCoordEncode(nn.Module):
         class_embedding = self.class_embedding(class_ids)
         coord_embedding = self.coord_embedding(coords)
         return torch.cat([class_embedding, coord_embedding], dim=2)
-
 
 

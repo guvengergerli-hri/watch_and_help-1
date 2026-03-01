@@ -360,7 +360,8 @@ class HRL_agent_RL:
             'hidden_size': args.hidden_size,
             'max_nodes': self.max_num_objects,
             'num_classes': self.num_object_classes,
-            'num_states': self.num_states
+            'num_states': self.num_states,
+            'goal_cond_mode': args.goal_cond_mode,
 
         }
 
@@ -479,6 +480,7 @@ class HRL_agent_RL:
         target_obj_class = [self.graph_helper.object_dict.get_id('no_obj')] * 6
         target_loc_class = [self.graph_helper.object_dict.get_id('no_obj')] * 6
         mask_goal_pred = [0.0] * 6
+        obj_class_id = int(self.graph_helper.object_dict.get_id('no_obj'))
 
         pre_id = 0
         obj_pred_names, loc_pred_names = [], []
@@ -487,28 +489,29 @@ class HRL_agent_RL:
         #### Inputs high level policy
         ##############################
 
-        for predicate, info in goal_spec.items():
-            count, required, reward = info
-            if count == 0 or not required or 'sit' in predicate:
-                continue
+        if self.args.goal_cond_mode == 'gt':
+            for predicate, info in goal_spec.items():
+                count, required, reward = info
+                if count == 0 or not required or 'sit' in predicate:
+                    continue
 
-            # if not (predicate.startswith('on') or predicate.startswith('inside')):
-            #     continue
+                # if not (predicate.startswith('on') or predicate.startswith('inside')):
+                #     continue
 
-            elements = predicate.split('_')
-            obj_class_id = int(self.graph_helper.object_dict.get_id(elements[1]))
-            loc_class_id = int(self.graph_helper.object_dict.get_id(self.id2node[int(elements[2])]['class_name']))
+                elements = predicate.split('_')
+                obj_class_id = int(self.graph_helper.object_dict.get_id(elements[1]))
+                loc_class_id = int(self.graph_helper.object_dict.get_id(self.id2node[int(elements[2])]['class_name']))
 
-            obj_pred_names.append(elements[1])
-            loc_pred_names.append(self.id2node[int(elements[2])]['class_name'])
-            for _ in range(count):
-                try:
-                    target_obj_class[pre_id] = obj_class_id
-                    target_loc_class[pre_id] = loc_class_id
-                    mask_goal_pred[pre_id] = 1.0
-                    pre_id += 1
-                except:
-                    pdb.set_trace()
+                obj_pred_names.append(elements[1])
+                loc_pred_names.append(self.id2node[int(elements[2])]['class_name'])
+                for _ in range(count):
+                    try:
+                        target_obj_class[pre_id] = obj_class_id
+                        target_loc_class[pre_id] = loc_class_id
+                        mask_goal_pred[pre_id] = 1.0
+                        pre_id += 1
+                    except:
+                        pdb.set_trace()
 
 
         inputs.update({

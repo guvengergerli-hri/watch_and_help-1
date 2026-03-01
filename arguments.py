@@ -340,6 +340,13 @@ def get_args():
 
     parser.add_argument('--c_loss_close', type=float, default=0., help='coefficient auxiliary loss goal close')
     parser.add_argument('--c_loss_goal', type=float, default=0., help='coefficient auxiliary loss goal obj')
+    parser.add_argument(
+        '--goal-cond-mode',
+        type=str,
+        default='gt',
+        choices=['gt', 'none'],
+        help='goal-conditioning mode: gt uses task-goal tensors; none disables goal-conditioning in the policy model',
+    )
 
     # Optional visualization hooks for test/eval scripts.
     parser.add_argument('--viz-eval-enable', action='store_true', default=False,

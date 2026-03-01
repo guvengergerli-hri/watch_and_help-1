@@ -43,13 +43,16 @@ class ActorCritic(nn.Module):
         else:
             raise NotImplementedError
 
-        node_encoder = base(**base_kwargs)
+        encoder_kwargs = dict(base_kwargs)
+        goal_cond_mode = encoder_kwargs.pop('goal_cond_mode', 'gt')
+        node_encoder = base(**encoder_kwargs)
         self.hidden_size = base_kwargs['hidden_size']
         self.base = base_nets.GoalAttentionModel(hidden_size=base_kwargs['hidden_size'],
                                                  recurrent=True,
                                                  num_classes=base_kwargs['num_classes'],
                                                  node_encoder=node_encoder,
-                                                 context_type=context_type)
+                                                 context_type=context_type,
+                                                 goal_cond_mode=goal_cond_mode)
         self.critic_linear = init_(nn.Linear(base_kwargs['hidden_size'], 1))
 
         # Distribution for the actions: Action, Obj1, Obj2
@@ -144,8 +147,6 @@ class ActorCritic(nn.Module):
             #print('PROBABILITY', actions_probs[action])
         outputs = None
         return value, actions, actions_probs, rnn_hxs, outputs
-
-
 
 
 

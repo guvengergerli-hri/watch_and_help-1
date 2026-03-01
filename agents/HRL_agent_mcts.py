@@ -359,7 +359,8 @@ class HRL_agent:
             'hidden_size': args.hidden_size,
             'max_nodes': self.max_num_objects,
             'num_classes': self.num_object_classes,
-            'num_states': self.num_states
+            'num_states': self.num_states,
+            'goal_cond_mode': args.goal_cond_mode,
 
         }
 
@@ -459,6 +460,7 @@ class HRL_agent:
         target_obj_class = [self.graph_helper.object_dict.get_id('no_obj')] * 6
         target_loc_class = [self.graph_helper.object_dict.get_id('no_obj')] * 6
         mask_goal_pred = [0.0] * 6
+        obj_class_id = int(self.graph_helper.object_dict.get_id('no_obj'))
 
         pre_id = 0
         obj_pred_names, loc_pred_names = [], []
@@ -474,16 +476,20 @@ class HRL_agent:
             obj_class_id = int(self.graph_helper.object_dict.get_id(elements[1]))
             loc_class_id = int(self.graph_helper.object_dict.get_id(self.id2node[int(elements[2])]['class_name']))
 
+            # Keep goal name lists for off-goal filtering in all modes.
             obj_pred_names.append(elements[1])
             loc_pred_names.append(self.id2node[int(elements[2])]['class_name'])
-            for _ in range(count):
-                try:
-                    target_obj_class[pre_id] = obj_class_id
-                    target_loc_class[pre_id] = loc_class_id
-                    mask_goal_pred[pre_id] = 1.0
-                    pre_id += 1
-                except:
-                    pdb.set_trace()
+
+            # Only use privileged goal tensors for model conditioning in GT mode.
+            if self.args.goal_cond_mode == 'gt':
+                for _ in range(count):
+                    try:
+                        target_obj_class[pre_id] = obj_class_id
+                        target_loc_class[pre_id] = loc_class_id
+                        mask_goal_pred[pre_id] = 1.0
+                        pre_id += 1
+                    except:
+                        pdb.set_trace()
         inputs.update({
             'affordance_matrix': self.graph_helper.obj1_affordance,
             'target_obj_class': target_obj_class,
@@ -540,7 +546,9 @@ class HRL_agent:
             container_pred = p_spl[2]
             # Check if the predicate corresponds to the goal
             # This is to facilitate traiing
-            if obj_pred not in obj_pred_names or container_pred not in loc_pred_names and self.mode == 'train':
+            if self.mode == 'train' and (
+                obj_pred not in obj_pred_names or container_pred not in loc_pred_names
+            ):
                 info_model['bad_predicate'] = True
                 action_str = None
                 action_tried += ' (offgoal)'
