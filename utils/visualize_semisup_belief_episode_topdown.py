@@ -49,14 +49,20 @@ else:
     from utils.utils_plot import plot_graph_2d
 
 from watch.vae.semisup_model import GraphSequenceSemiSupVAE
+from watch.vae.model import GraphSequenceVAE
 from watch.vae.tensorizer import WatchGraphTensorizer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render a dataset episode as top-down frames with SSVAE y-belief overlays and MP4 export."
+        description="Render a dataset episode as top-down frames with semisup/joint VAE y-belief overlays and MP4 export."
     )
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to watch_semisup_vae_{best,last}.pt checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a watch_semisup_vae_{best,last}.pt or watch_vae_joint_{best,last}.pt checkpoint",
+    )
     parser.add_argument(
         "--data-json",
         type=str,
@@ -178,7 +184,7 @@ def _load_goal_vocab(
 def _load_semisup_model_and_tensorizer(
     checkpoint_path: str,
     device: torch.device,
-) -> Tuple[Dict[str, Any], GraphSequenceSemiSupVAE, WatchGraphTensorizer]:
+) -> Tuple[Dict[str, Any], torch.nn.Module, WatchGraphTensorizer, str]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if not isinstance(checkpoint, dict):
         raise TypeError("Checkpoint is not a dict: {}".format(type(checkpoint).__name__))
@@ -190,15 +196,55 @@ def _load_semisup_model_and_tensorizer(
     model_config = checkpoint["model_config"]
     if not isinstance(model_config, dict):
         raise TypeError("checkpoint['model_config'] must be a dict")
-    if "num_goal_predicates" not in model_config:
-        raise ValueError("Checkpoint model_config has no num_goal_predicates; expected SSVAE checkpoint.")
+    model_state = checkpoint["model_state"]
+    if not isinstance(model_state, dict):
+        raise TypeError("checkpoint['model_state'] must be a state dict")
 
-    model = GraphSequenceSemiSupVAE.from_config(model_config).to(device)
+    state_keys = set([str(k) for k in model_state.keys()])
+    is_semisup = "goal_head.weight" in state_keys
+    is_joint = ("belief_weight" in state_keys) or bool(model_config.get("enable_predicate_head", False))
+
+    if is_semisup:
+        model_type = "semisup"
+        model = GraphSequenceSemiSupVAE.from_config(model_config).to(device)
+    elif is_joint:
+        model_type = "joint"
+        model = GraphSequenceVAE.from_config(model_config).to(device)
+        if not bool(getattr(model, "enable_predicate_head", False)):
+            raise ValueError("Joint VAE checkpoint does not have predicate head enabled; cannot visualize beliefs.")
+    else:
+        raise ValueError(
+            "Unsupported checkpoint for belief visualization. Expected semisup (goal_head.*) or joint (belief_*)."
+        )
+
     model.load_state_dict(checkpoint["model_state"], strict=True)
     model.eval()
 
     tensorizer = WatchGraphTensorizer.from_config(checkpoint["tensorizer_config"])
-    return checkpoint, model, tensorizer
+    return checkpoint, model, tensorizer, model_type
+
+
+def _infer_y_probs_seq(model: torch.nn.Module, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    if hasattr(model, "infer_y_probs_seq"):
+        out = model.infer_y_probs_seq(batch)  # type: ignore[attr-defined]
+        if isinstance(out, dict) and "y_probs_seq" in out:
+            return out["y_probs_seq"]
+        raise TypeError("model.infer_y_probs_seq(batch) must return dict with key 'y_probs_seq'")
+
+    if hasattr(model, "predicate_logits_from_mu_sequence") and hasattr(model, "encode_sequence"):
+        action_ids = batch.get("action_ids")
+        _, mu, _ = model.encode_sequence(  # type: ignore[attr-defined]
+            class_ids=batch["class_ids"],
+            coords=batch["coords"],
+            states=batch["states"],
+            node_mask=batch["node_mask"],
+            lengths=batch["lengths"],
+            action_ids=action_ids,
+        )
+        logits_seq = model.predicate_logits_from_mu_sequence(mu)  # type: ignore[attr-defined]
+        return torch.sigmoid(logits_seq)
+
+    raise TypeError("Model does not expose semisup or joint belief inference APIs")
 
 
 def _encode_single_demo_batch(
@@ -457,7 +503,7 @@ def main() -> None:
     device = _resolve_device(args.device)
 
     checkpoint_path = Path(args.checkpoint)
-    checkpoint, model, tensorizer = _load_semisup_model_and_tensorizer(str(checkpoint_path), device=device)
+    checkpoint, model, tensorizer, model_type = _load_semisup_model_and_tensorizer(str(checkpoint_path), device=device)
     predicate_names, goal_to_col = _load_goal_vocab(checkpoint, args.metadata)
 
     data_json_str, split_key = _infer_data_inputs_from_checkpoint(checkpoint, args.data_json, args.split_key)
@@ -475,8 +521,7 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        y_out = model.infer_y_probs_seq(batch)
-        y_probs_seq = y_out["y_probs_seq"][0].detach().cpu().numpy()  # [T, K]
+        y_probs_seq = _infer_y_probs_seq(model, batch)[0].detach().cpu().numpy()  # [T, K]
 
     total_steps = int(inferred_steps)
     if y_probs_seq.shape[0] != total_steps:
@@ -588,6 +633,7 @@ def main() -> None:
     belief_summary_json = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint.get("epoch"),
+        "model_type": model_type,
         "device": str(device),
         "model_use_actions": bool(getattr(model, "use_actions", False)),
         "num_goal_predicates": len(predicate_names),

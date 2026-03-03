@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stable-slots", action="store_false", dest="stable_slots")
 
     parser.add_argument("--use-actions", action="store_true", default=False)
+    parser.add_argument("--reconstruct-actions", action="store_true", dest="reconstruct_actions")
+    parser.add_argument("--no-reconstruct-actions", action="store_false", dest="reconstruct_actions")
+    parser.set_defaults(reconstruct_actions=None)
+    parser.add_argument("--action-weight", type=float, default=0.1)
     parser.add_argument("--kl-weight", type=float, default=0.01)
     parser.add_argument("--class-weight", type=float, default=1.0)
     parser.add_argument("--state-weight", type=float, default=1.0)
@@ -131,11 +135,45 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    try:
+        device = torch.device(device_arg)
+    except Exception as exc:
+        raise ValueError("Invalid --device '{}': {}".format(device_arg, exc)) from exc
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA device '{}' was requested, but torch.cuda.is_available() is False. "
+                "Install CUDA-enabled PyTorch or pass --device cpu.".format(device_arg)
+            )
+        if device.index is not None and (device.index < 0 or device.index >= torch.cuda.device_count()):
+            raise RuntimeError(
+                "CUDA device index out of range for '{}'. Visible CUDA device count: {}.".format(
+                    device_arg,
+                    torch.cuda.device_count(),
+                )
+            )
+    return device
+
+
+def print_device_summary(device: torch.device) -> None:
+    print("torch version:", torch.__version__)
+    print("cuda available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("cuda device count:", torch.cuda.device_count())
+    print("device:", device)
+    if device.type == "cuda":
+        idx = torch.cuda.current_device() if device.index is None else int(device.index)
+        print("using cuda device index:", idx)
+        print("using cuda device name:", torch.cuda.get_device_name(idx))
+
+
 def move_batch_to_device(batch: Dict[str, object], device: torch.device) -> Dict[str, object]:
     out: Dict[str, object] = {}
     for key, value in batch.items():
         if torch.is_tensor(value):
-            out[key] = value.to(device)
+            out[key] = value.to(device, non_blocking=True)
         else:
             out[key] = value
     return out
@@ -209,13 +247,15 @@ def attach_goal_labels(
 
 def build_experiment_slug(args: argparse.Namespace) -> str:
     raw = (
-        "hid{hid}_lat{lat}_lr{lr}_bs{bs}_ss{ss}_kl{kl}_ybce{ybce}_ykl{ykl}_ydyn{ydyn}_yt{yt}_lf{lf}"
+        "hid{hid}_lat{lat}_lr{lr}_bs{bs}_ss{ss}_ra{ra}_aw{aw}_kl{kl}_ybce{ybce}_ykl{ykl}_ydyn{ydyn}_yt{yt}_lf{lf}"
     ).format(
         hid=args.hidden_size,
         lat=args.latent_size,
         lr=args.lr,
         bs=args.batch_size,
         ss=int(args.stable_slots),
+        ra=int(args.reconstruct_actions),
+        aw=args.action_weight,
         kl=args.kl_weight,
         ybce=args.y_bce_weight,
         ykl=args.y_kl_weight,
@@ -229,7 +269,7 @@ def build_experiment_slug(args: argparse.Namespace) -> str:
 
 def build_experiment_title(args: argparse.Namespace) -> str:
     return (
-        "watch_semisup_vae | hid={hid} lat={lat} lr={lr} bs={bs} kl={kl} "
+        "watch_semisup_vae | hid={hid} lat={lat} lr={lr} bs={bs} kl={kl} recon_act={ra} aw={aw} "
         "y_bce={ybce} y_kl={ykl} y_dyn={ydyn} y0={y0} y_temp={yt} labeled={lf} "
         "condZ={cz} condDec={cd} teacherY={ty}"
     ).format(
@@ -238,6 +278,8 @@ def build_experiment_title(args: argparse.Namespace) -> str:
         lr=args.lr,
         bs=args.batch_size,
         kl=args.kl_weight,
+        ra=int(args.reconstruct_actions),
+        aw=args.action_weight,
         ybce=args.y_bce_weight,
         ykl=args.y_kl_weight,
         ydyn=args.y_dyn_kl_weight,
@@ -410,13 +452,15 @@ def run_epoch(
 
         if train and (batch_idx + 1) % log_interval == 0:
             print(
-                "train step {:04d}/{:04d} loss={:.4f} goal_bce={:.4f} goal_f1={:.4f} kl_z={:.4f}".format(
+                "train step {:04d}/{:04d} loss={:.4f} goal_bce={:.4f} goal_f1={:.4f} kl_z={:.4f} action={:.4f} action_acc={:.4f}".format(
                     batch_idx + 1,
                     len(loader),
                     float(losses["loss"].item()),
                     float(losses["goal_bce_loss"].item()),
                     float(losses["goal_f1_0p5"].item()),
                     float(losses["kl_loss"].item()),
+                    float(losses.get("action_loss", loss * 0.0).item()),
+                    float(losses.get("action_acc", loss * 0.0).item()),
                 )
             )
 
@@ -610,12 +654,25 @@ def save_and_log_belief_profile(
 
 def main() -> None:
     args = parse_args()
+    if args.reconstruct_actions is None:
+        args.reconstruct_actions = bool(args.use_actions)
+    else:
+        args.reconstruct_actions = bool(args.reconstruct_actions)
+    if args.action_weight < 0.0:
+        raise ValueError("--action-weight must be >= 0")
+    if args.reconstruct_actions and (not args.use_actions):
+        raise ValueError("--reconstruct-actions requires --use-actions")
     resolve_label_fraction(args)
     set_seed(args.seed)
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
 
-    device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
+    device = resolve_device(args.device)
+    if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.set_device(device.index)
+        torch.backends.cudnn.benchmark = True
+    print_device_summary(device)
     os.makedirs(args.output_dir, exist_ok=True)
     if not args.disable_tensorboard:
         os.makedirs(args.tensorboard_logdir, exist_ok=True)
@@ -626,6 +683,8 @@ def main() -> None:
     print("effective labeled fraction:", args.effective_labeled_fraction)
     print("effective label mask prob:", args.effective_label_mask_prob)
     print("label mask mode:", args.label_mask_mode)
+    print("reconstruct actions:", args.reconstruct_actions)
+    print("action weight:", args.action_weight)
 
     train_dataset = WatchVAEDataset(
         data_path=args.train_json,
@@ -676,21 +735,25 @@ def main() -> None:
         args.fixed_label_subset_seed = None
         args.fixed_label_subset_actual_fraction = None
 
+    loader_common = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "collate_fn": collate_watch_vae,
+        "drop_last": False,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_common["persistent_workers"] = True
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_watch_vae,
-        drop_last=False,
+        **loader_common,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_watch_vae,
-        drop_last=False,
+        **loader_common,
     )
 
     model = GraphSequenceSemiSupVAE(
@@ -703,6 +766,8 @@ def main() -> None:
         transformer_nhead=args.transformer_nhead,
         use_actions=args.use_actions,
         num_actions=tensorizer.num_actions,
+        reconstruct_actions=args.reconstruct_actions,
+        action_weight=args.action_weight,
         kl_weight=args.kl_weight,
         class_weight=args.class_weight,
         state_weight=args.state_weight,
@@ -752,6 +817,7 @@ def main() -> None:
         writer.add_text("config/backbone_init_report", json.dumps(init_report, indent=2), 0)
         writer.add_scalar("config/effective_labeled_fraction", args.effective_labeled_fraction, 0)
         writer.add_scalar("config/effective_label_mask_prob", args.effective_label_mask_prob, 0)
+        writer.add_scalar("config/action_weight", args.action_weight, 0)
 
     best_val = float("inf")
     history = []
@@ -786,7 +852,7 @@ def main() -> None:
 
         print(
             "epoch {:03d} train_loss={:.4f} val_loss={:.4f} val_goal_bce={:.4f} "
-            "val_goal_f1_last={:.4f} val_goal_f1_all={:.4f} val_klz={:.4f}".format(
+            "val_goal_f1_last={:.4f} val_goal_f1_all={:.4f} val_klz={:.4f} val_action={:.4f} val_action_acc={:.4f}".format(
                 epoch,
                 train_metrics["loss"],
                 val_metrics["loss"],
@@ -794,6 +860,8 @@ def main() -> None:
                 val_metrics.get("goal_f1_0p5_last", val_metrics.get("goal_f1_0p5", 0.0)),
                 val_metrics.get("goal_f1_0p5_allsteps", 0.0),
                 val_metrics["kl_loss"],
+                val_metrics.get("action_loss", 0.0),
+                val_metrics.get("action_acc", 0.0),
             )
         )
 

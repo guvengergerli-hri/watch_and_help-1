@@ -29,6 +29,8 @@ interface/Player.log
 rl/logs.txt
 visualization/*.mp4
 *.sh
+!scripts/train_watch_vae_predicate_vectors.sh
+!scripts/train_watch_vae_joint.sh
 /checkpoints
 /dataset
 /trained_models_phase2

@@ -132,6 +132,50 @@ This saves checkpoints under `checkpoints/watch_vae` with:
    - you can switch to `full_encoder` with `--teacher-scope full_encoder`
 6. TensorBoard events under `log_tb/watch_vae/<timestamp>_<experiment_slug>/` (isolated per experiment)
 
+### Train VAE Predicate Vectors (Stage-2, label-only head)
+To train a predicate-vector head (`W,b`) on top of a frozen stage-1 Watch VAE encoder, run:
+
+```bash
+VAE_CKPT=checkpoints/watch_vae/<run>/watch_vae_best.pt \
+bash scripts/train_watch_vae_predicate_vectors.sh
+```
+
+This stage:
+1. Loads and freezes the VAE backbone from `VAE_CKPT`
+2. Trains only predicate vectors using demo-level Watch goal labels
+3. Supports SSVAE-style label controls (`--labeled-fraction`, `--label-mask-mode`, `--label-mask-seed`)
+4. Saves stage-2 checkpoints under `checkpoints/watch_vae_predicate_vectors/<timestamp>_<experiment_slug>/`
+   - `watch_vae_predicate_vectors_last.pt`, `watch_vae_predicate_vectors_best.pt`
+   - optional merged checkpoints with VAE+head: `watch_vae_with_predicates_last.pt`, `watch_vae_with_predicates_best.pt`
+5. Writes TensorBoard logs under `log_tb/watch_vae_predicate_vectors/<timestamp>_<experiment_slug>/`
+
+### Train Joint Watch VAE + Predicate Vectors
+To train the Watch VAE and predicate vectors jointly (single run, unified loss), run:
+
+```bash
+bash scripts/train_watch_vae_joint.sh
+```
+
+This joint stage:
+1. Trains VAE reconstruction/KL (plus optional action reconstruction) on all demos.
+2. Adds an all-timestep predicate-vector auxiliary BCE loss on demo goals.
+3. Supports fixed/stochastic label masking controls for predicate supervision:
+   - `LABELED_FRACTION` (for example `0.1`)
+   - `LABEL_MASK_MODE` (`fixed` or `stochastic`)
+   - `LABEL_MASK_SEED` (for deterministic fixed subsets)
+4. Uses per-predicate positive-class weighting (`pos_weight`) computed from training labels.
+5. Saves checkpoints under `checkpoints/watch_vae_joint/<timestamp>_<experiment_slug>/`:
+   - `watch_vae_joint_last.pt`, `watch_vae_joint_best.pt`, `best_model.pt`
+   - teacher exports: `teacher_encoder_last.pt`, `teacher_encoder_best.pt`, `teacher_frozen.pt`
+6. Writes TensorBoard logs under `log_tb/watch_vae_joint/<timestamp>_<experiment_slug>/`
+
+Example:
+```bash
+LABELED_FRACTION=0.1 LABEL_MASK_MODE=fixed LABEL_MASK_SEED=123 \
+PREDICATE_AUX_WEIGHT=0.5 USE_ACTIONS=1 RECONSTRUCT_ACTIONS=1 ACTION_WEIGHT=0.1 \
+bash scripts/train_watch_vae_joint.sh
+```
+
 You can also export a teacher encoder from an existing VAE checkpoint:
 
 ```bash

@@ -37,6 +37,7 @@ if __package__:
         _bernoulli_entropy_mean_per_step,
         _choose_tracked_predicates,
         _encode_single_demo_batch,
+        _infer_y_probs_seq,
         _infer_data_inputs_from_checkpoint,
         _load_goal_vocab,
         _load_semisup_model_and_tensorizer,
@@ -64,6 +65,7 @@ else:
         _bernoulli_entropy_mean_per_step,
         _choose_tracked_predicates,
         _encode_single_demo_batch,
+        _infer_y_probs_seq,
         _infer_data_inputs_from_checkpoint,
         _load_goal_vocab,
         _load_semisup_model_and_tensorizer,
@@ -75,9 +77,14 @@ else:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay a dataset episode in Unity and render per-step snapshots with SSVAE belief overlays."
+        description="Replay a dataset episode in Unity and render per-step snapshots with semisup/joint VAE belief overlays."
     )
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to watch_semisup_vae_{best,last}.pt checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a watch_semisup_vae_{best,last}.pt or watch_vae_joint_{best,last}.pt checkpoint",
+    )
     parser.add_argument(
         "--data-json",
         type=str,
@@ -674,7 +681,7 @@ def main() -> None:
 
     _log("Loading checkpoint/model: {}".format(args.checkpoint))
     checkpoint_path = Path(args.checkpoint)
-    checkpoint, model, tensorizer = _load_semisup_model_and_tensorizer(str(checkpoint_path), device=device)
+    checkpoint, model, tensorizer, model_type = _load_semisup_model_and_tensorizer(str(checkpoint_path), device=device)
     predicate_names, goal_to_col = _load_goal_vocab(checkpoint, args.metadata)
 
     _log("Loading dataset split metadata")
@@ -694,8 +701,7 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        y_out = model.infer_y_probs_seq(batch)
-        y_probs_seq = y_out["y_probs_seq"][0].detach().cpu().numpy()  # [T, K]
+        y_probs_seq = _infer_y_probs_seq(model, batch)[0].detach().cpu().numpy()  # [T, K]
 
     total_steps = int(inferred_steps)
     if y_probs_seq.shape[0] != total_steps:
@@ -788,9 +794,15 @@ def main() -> None:
             comm.check_connection()
             _log("Unity connection confirmed")
         except Exception as e:
+            hint = ""
+            if not bool(args.no_graphics):
+                hint = (
+                    " Hint: Unity failed before opening the HTTP port. On headless machines, pass --no-graphics "
+                    "(or set NO_GRAPHICS=1 in the shell wrapper)."
+                )
             raise RuntimeError(
-                "Could not connect to Unity on port {}. If not already running, pass --unity-executable. Error: {}".format(
-                    unity_port, repr(e)
+                "Could not connect to Unity on port {}. If not already running, pass --unity-executable. Error: {}{}".format(
+                    unity_port, repr(e), hint
                 )
             )
 
@@ -980,6 +992,7 @@ def main() -> None:
     belief_summary_json = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint.get("epoch"),
+        "model_type": model_type,
         "device": str(device),
         "model_use_actions": bool(getattr(model, "use_actions", False)),
         "num_goal_predicates": len(predicate_names),

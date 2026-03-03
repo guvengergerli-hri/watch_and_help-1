@@ -54,6 +54,14 @@ class WatchVAEDataset(Dataset):
             if seq_len < self.min_seq_len:
                 continue
 
+            # Precompute stable slot-map once at dataset construction time to avoid
+            # mutating per-sample state inside DataLoader worker processes.
+            slot_map = (
+                self.tensorizer.build_stable_slot_map(graphs[:seq_len])
+                if self.stable_slots
+                else None
+            )
+
             self.demos.append(
                 {
                     "name": demo.get("name", "unknown"),
@@ -62,7 +70,7 @@ class WatchVAEDataset(Dataset):
                     "seq_len": seq_len,
                     "goal": demo.get("goal", []),
                     "task_name": demo.get("task_name", "unknown"),
-                    "slot_map": None,
+                    "slot_map": slot_map,
                 }
             )
             if max_demos is not None and len(self.demos) >= int(max_demos):
@@ -81,11 +89,7 @@ class WatchVAEDataset(Dataset):
         mask_seq = []
         action_seq = []
 
-        slot_map = None
-        if self.stable_slots:
-            if demo["slot_map"] is None:
-                demo["slot_map"] = self.tensorizer.build_stable_slot_map(demo["graphs"][:seq_len])
-            slot_map = demo["slot_map"]
+        slot_map = demo["slot_map"] if self.stable_slots else None
 
         for step_idx in range(seq_len):
             if self.stable_slots:

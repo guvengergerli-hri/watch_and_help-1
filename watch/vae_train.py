@@ -51,7 +51,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stable-slots", action="store_false", dest="stable_slots")
 
     parser.add_argument("--use-actions", action="store_true", default=False)
+    parser.add_argument("--reconstruct-actions", action="store_true", dest="reconstruct_actions")
+    parser.add_argument("--no-reconstruct-actions", action="store_false", dest="reconstruct_actions")
+    parser.set_defaults(reconstruct_actions=None)
+    parser.add_argument("--action-weight", type=float, default=0.1)
     parser.add_argument("--kl-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--kl-warmup-epochs",
+        type=int,
+        default=0,
+        help="Linearly warm up KL weight over this many epochs (0 disables warmup).",
+    )
+    parser.add_argument(
+        "--kl-warmup-start-factor",
+        type=float,
+        default=0.0,
+        help="Starting fraction of --kl-weight at epoch 1 during warmup (range [0, 1]).",
+    )
+    parser.add_argument(
+        "--free-bits",
+        type=float,
+        default=0.0,
+        help="Free bits (nats per latent dim per timestep) applied to KL term.",
+    )
     parser.add_argument("--class-weight", type=float, default=1.0)
     parser.add_argument("--state-weight", type=float, default=1.0)
     parser.add_argument("--coord-weight", type=float, default=1.0)
@@ -88,11 +110,45 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    try:
+        device = torch.device(device_arg)
+    except Exception as exc:
+        raise ValueError("Invalid --device '{}': {}".format(device_arg, exc)) from exc
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA device '{}' was requested, but torch.cuda.is_available() is False. "
+                "Install CUDA-enabled PyTorch or pass --device cpu.".format(device_arg)
+            )
+        if device.index is not None and (device.index < 0 or device.index >= torch.cuda.device_count()):
+            raise RuntimeError(
+                "CUDA device index out of range for '{}'. Visible CUDA device count: {}.".format(
+                    device_arg,
+                    torch.cuda.device_count(),
+                )
+            )
+    return device
+
+
+def print_device_summary(device: torch.device) -> None:
+    print("torch version:", torch.__version__)
+    print("cuda available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("cuda device count:", torch.cuda.device_count())
+    print("device:", device)
+    if device.type == "cuda":
+        idx = torch.cuda.current_device() if device.index is None else int(device.index)
+        print("using cuda device index:", idx)
+        print("using cuda device name:", torch.cuda.get_device_name(idx))
+
+
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     out = {}
     for key, value in batch.items():
         if torch.is_tensor(value):
-            out[key] = value.to(device)
+            out[key] = value.to(device, non_blocking=True)
         else:
             out[key] = value
     return out
@@ -101,7 +157,7 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
 def build_experiment_title(args: argparse.Namespace) -> str:
     return (
         "watch_vae | hid={hid} lat={lat} lr={lr} bs={bs} act={act} stable_slots={ss} "
-        "kl={kl} cls={cw} st={sw} coord={ow} mask={mw}"
+        "recon_act={ra} aw={aw} kl={kl} kwu={kwu} kws={kws} fb={fb} cls={cw} st={sw} coord={ow} mask={mw}"
     ).format(
         hid=args.hidden_size,
         lat=args.latent_size,
@@ -109,7 +165,12 @@ def build_experiment_title(args: argparse.Namespace) -> str:
         bs=args.batch_size,
         act=int(args.use_actions),
         ss=int(args.stable_slots),
+        ra=int(args.reconstruct_actions),
+        aw=args.action_weight,
         kl=args.kl_weight,
+        kwu=args.kl_warmup_epochs,
+        kws=args.kl_warmup_start_factor,
+        fb=args.free_bits,
         cw=args.class_weight,
         sw=args.state_weight,
         ow=args.coord_weight,
@@ -119,7 +180,7 @@ def build_experiment_title(args: argparse.Namespace) -> str:
 
 def build_experiment_slug(args: argparse.Namespace) -> str:
     raw = (
-        "hid{hid}_lat{lat}_lr{lr}_bs{bs}_act{act}_ss{ss}_kl{kl}_cw{cw}_sw{sw}_ow{ow}_mw{mw}"
+        "hid{hid}_lat{lat}_lr{lr}_bs{bs}_act{act}_ss{ss}_ra{ra}_aw{aw}_kl{kl}_kwu{kwu}_kws{kws}_fb{fb}_cw{cw}_sw{sw}_ow{ow}_mw{mw}"
     ).format(
         hid=args.hidden_size,
         lat=args.latent_size,
@@ -127,7 +188,12 @@ def build_experiment_slug(args: argparse.Namespace) -> str:
         bs=args.batch_size,
         act=int(args.use_actions),
         ss=int(args.stable_slots),
+        ra=int(args.reconstruct_actions),
+        aw=args.action_weight,
         kl=args.kl_weight,
+        kwu=args.kl_warmup_epochs,
+        kws=args.kl_warmup_start_factor,
+        fb=args.free_bits,
         cw=args.class_weight,
         sw=args.state_weight,
         ow=args.coord_weight,
@@ -377,7 +443,7 @@ def run_epoch(
 
         if train and (batch_idx + 1) % log_interval == 0:
             print(
-                "train step {:04d}/{:04d} loss={:.4f} kl={:.4f} class={:.4f} state={:.4f} coord={:.4f}".format(
+                "train step {:04d}/{:04d} loss={:.4f} kl={:.4f} class={:.4f} state={:.4f} coord={:.4f} action={:.4f} action_acc={:.4f}".format(
                     batch_idx + 1,
                     len(loader),
                     float(losses["loss"].item()),
@@ -385,6 +451,8 @@ def run_epoch(
                     float(losses["class_loss"].item()),
                     float(losses["state_loss"].item()),
                     float(losses["coord_loss"].item()),
+                    float(losses["action_loss"].item()),
+                    float(losses["action_acc"].item()),
                 )
             )
 
@@ -394,13 +462,47 @@ def run_epoch(
     return {key: value / n_batches for key, value in running.items()}
 
 
+def kl_weight_for_epoch(args: argparse.Namespace, epoch: int) -> float:
+    warmup_epochs = int(args.kl_warmup_epochs)
+    if warmup_epochs <= 0:
+        return float(args.kl_weight)
+
+    if warmup_epochs == 1:
+        progress = 1.0
+    else:
+        progress = min(1.0, max(0.0, float(epoch - 1) / float(warmup_epochs - 1)))
+
+    start = float(args.kl_warmup_start_factor)
+    scale = start + (1.0 - start) * progress
+    return float(args.kl_weight) * scale
+
+
 def main() -> None:
     args = parse_args()
+    if args.reconstruct_actions is None:
+        args.reconstruct_actions = bool(args.use_actions)
+    else:
+        args.reconstruct_actions = bool(args.reconstruct_actions)
+    if args.kl_warmup_epochs < 0:
+        raise ValueError("--kl-warmup-epochs must be >= 0")
+    if not (0.0 <= args.kl_warmup_start_factor <= 1.0):
+        raise ValueError("--kl-warmup-start-factor must be in [0, 1]")
+    if args.free_bits < 0.0:
+        raise ValueError("--free-bits must be >= 0")
+    if args.action_weight < 0.0:
+        raise ValueError("--action-weight must be >= 0")
+    if args.reconstruct_actions and (not args.use_actions):
+        raise ValueError("--reconstruct-actions requires --use-actions")
     set_seed(args.seed)
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
 
-    device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
+    device = resolve_device(args.device)
+    if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.set_device(device.index)
+        torch.backends.cudnn.benchmark = True
+    print_device_summary(device)
     os.makedirs(args.output_dir, exist_ok=True)
     if not args.disable_tensorboard:
         os.makedirs(args.tensorboard_logdir, exist_ok=True)
@@ -430,6 +532,11 @@ def main() -> None:
         writer.add_text("config/run_output_dir", run_output_dir, 0)
         writer.add_text("config/tensorboard_run_dir", tb_run_dir, 0)
         writer.add_text("config/teacher_scope", args.teacher_scope, 0)
+        writer.add_scalar("config/kl_weight_target", args.kl_weight, 0)
+        writer.add_scalar("config/kl_warmup_epochs", args.kl_warmup_epochs, 0)
+        writer.add_scalar("config/kl_warmup_start_factor", args.kl_warmup_start_factor, 0)
+        writer.add_scalar("config/free_bits", args.free_bits, 0)
+        writer.add_scalar("config/action_weight", args.action_weight, 0)
     if plt is None:
         print("Warning: matplotlib not available; figure plotting disabled.")
 
@@ -462,22 +569,28 @@ def main() -> None:
     print("num states:", tensorizer.num_states)
     print("num actions:", tensorizer.num_actions)
     print("stable slots:", args.stable_slots)
+    print("reconstruct actions:", args.reconstruct_actions)
+    print("action weight:", args.action_weight)
+
+    loader_common = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "collate_fn": collate_watch_vae,
+        "drop_last": False,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_common["persistent_workers"] = True
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_watch_vae,
-        drop_last=False,
+        **loader_common,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_watch_vae,
-        drop_last=False,
+        **loader_common,
     )
 
     model = GraphSequenceVAE(
@@ -489,7 +602,10 @@ def main() -> None:
         transformer_nhead=args.transformer_nhead,
         use_actions=args.use_actions,
         num_actions=tensorizer.num_actions,
+        reconstruct_actions=args.reconstruct_actions,
+        action_weight=args.action_weight,
         kl_weight=args.kl_weight,
+        free_bits=args.free_bits,
         class_weight=args.class_weight,
         state_weight=args.state_weight,
         coord_weight=args.coord_weight,
@@ -508,6 +624,8 @@ def main() -> None:
     history = []
 
     for epoch in range(1, args.epochs + 1):
+        current_kl_weight = kl_weight_for_epoch(args, epoch)
+        model.kl_weight = current_kl_weight
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -528,14 +646,17 @@ def main() -> None:
         )
 
         print(
-            "epoch {:03d} train_loss={:.4f} val_loss={:.4f} val_kl={:.4f} val_class={:.4f} val_state={:.4f} val_coord={:.4f}".format(
+            "epoch {:03d} kl_w={:.6f} train_loss={:.4f} val_loss={:.4f} val_kl={:.4f} val_class={:.4f} val_state={:.4f} val_coord={:.4f} val_action={:.4f} val_action_acc={:.4f}".format(
                 epoch,
+                current_kl_weight,
                 train_metrics["loss"],
                 val_metrics["loss"],
                 val_metrics["kl_loss"],
                 val_metrics["class_loss"],
                 val_metrics["state_loss"],
                 val_metrics["coord_loss"],
+                val_metrics["action_loss"],
+                val_metrics["action_acc"],
             )
         )
 
@@ -553,6 +674,7 @@ def main() -> None:
             for key, value in val_metrics.items():
                 writer.add_scalar("val/{}".format(key), value, epoch)
             writer.add_scalar("optim/lr", optimizer.param_groups[0]["lr"], epoch)
+            writer.add_scalar("optim/kl_weight", current_kl_weight, epoch)
             for key, value in latent_scalars.items():
                 writer.add_scalar("latent/{}".format(key), value, epoch)
             if len(latent_diag) > 0:
@@ -634,6 +756,7 @@ def main() -> None:
         history.append(
             {
                 "epoch": epoch,
+                "kl_weight": current_kl_weight,
                 "train": train_metrics,
                 "val": val_metrics,
                 "latent": latent_scalars,

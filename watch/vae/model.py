@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -115,13 +115,18 @@ class GraphSequenceVAE(nn.Module):
         transformer_nhead: int = 2,
         use_actions: bool = False,
         num_actions: int = 1,
+        reconstruct_actions: bool = False,
+        action_weight: float = 0.1,
         kl_weight: float = 1.0,
+        free_bits: float = 0.0,
         class_weight: float = 1.0,
         state_weight: float = 1.0,
         coord_weight: float = 1.0,
         mask_weight: float = 0.2,
         logvar_min: float = -10.0,
         logvar_max: float = 10.0,
+        enable_predicate_head: bool = False,
+        num_goal_predicates: int = 0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -132,14 +137,27 @@ class GraphSequenceVAE(nn.Module):
         self.transformer_nhead = transformer_nhead
         self.use_actions = use_actions
         self.num_actions = num_actions
+        self.reconstruct_actions = bool(reconstruct_actions)
+        self.action_weight = float(action_weight)
 
         self.kl_weight = kl_weight
+        self.free_bits = float(free_bits)
+        if self.free_bits < 0.0:
+            raise ValueError("free_bits must be >= 0")
+        if self.action_weight < 0.0:
+            raise ValueError("action_weight must be >= 0")
         self.class_weight = class_weight
         self.state_weight = state_weight
         self.coord_weight = coord_weight
         self.mask_weight = mask_weight
         self.logvar_min = logvar_min
         self.logvar_max = logvar_max
+        if self.reconstruct_actions and (not self.use_actions):
+            raise ValueError("reconstruct_actions=True requires use_actions=True")
+        if self.reconstruct_actions and self.num_actions <= 0:
+            raise ValueError("num_actions must be positive when reconstruct_actions=True")
+        self.enable_predicate_head = bool(enable_predicate_head)
+        self.num_goal_predicates = int(num_goal_predicates)
 
         self.frame_encoder = FrameEncoder(
             num_classes=num_classes,
@@ -168,6 +186,21 @@ class GraphSequenceVAE(nn.Module):
         self.state_head = nn.Linear(hidden_size, num_states)
         self.coord_head = nn.Linear(hidden_size, 6)
         self.mask_head = nn.Linear(hidden_size, 1)
+        if self.reconstruct_actions:
+            self.action_decoder = nn.Sequential(
+                nn.Linear(latent_size, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, num_actions),
+            )
+
+        self.register_parameter("belief_weight", None)
+        self.register_parameter("belief_bias", None)
+        if self.enable_predicate_head:
+            if self.num_goal_predicates <= 0:
+                raise ValueError("num_goal_predicates must be positive when enable_predicate_head=True")
+            self._init_predicate_head(self.num_goal_predicates)
+        else:
+            self.num_goal_predicates = 0
 
     def get_config(self) -> Dict[str, Any]:
         return {
@@ -179,13 +212,18 @@ class GraphSequenceVAE(nn.Module):
             "transformer_nhead": self.transformer_nhead,
             "use_actions": self.use_actions,
             "num_actions": self.num_actions,
+            "reconstruct_actions": self.reconstruct_actions,
+            "action_weight": self.action_weight,
             "kl_weight": self.kl_weight,
+            "free_bits": self.free_bits,
             "class_weight": self.class_weight,
             "state_weight": self.state_weight,
             "coord_weight": self.coord_weight,
             "mask_weight": self.mask_weight,
             "logvar_min": self.logvar_min,
             "logvar_max": self.logvar_max,
+            "enable_predicate_head": self.enable_predicate_head,
+            "num_goal_predicates": self.num_goal_predicates,
         }
 
     @classmethod
@@ -212,6 +250,143 @@ class GraphSequenceVAE(nn.Module):
                 prefixes.extend(["action_embedding.", "action_fuse."])
             return prefixes
         raise ValueError("Unknown teacher scope: {}. Expected one of: backbone, full_encoder".format(scope))
+
+    @staticmethod
+    def _pool_last(sequence: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        idx = (lengths - 1).clamp(min=0)
+        batch_idx = torch.arange(sequence.shape[0], device=sequence.device)
+        return sequence[batch_idx, idx]
+
+    def _init_predicate_head(self, num_goal_predicates: int) -> None:
+        if num_goal_predicates <= 0:
+            raise ValueError("num_goal_predicates must be positive")
+        ref = self.posterior_mu.weight
+        weight = torch.empty(
+            (int(num_goal_predicates), self.latent_size),
+            device=ref.device,
+            dtype=ref.dtype,
+        )
+        nn.init.xavier_uniform_(weight)
+        bias = torch.zeros((int(num_goal_predicates),), device=ref.device, dtype=ref.dtype)
+        self.belief_weight = nn.Parameter(weight)
+        self.belief_bias = nn.Parameter(bias)
+        self.enable_predicate_head = True
+        self.num_goal_predicates = int(num_goal_predicates)
+
+    def enable_predicate_vector_head(self, num_goal_predicates: int) -> None:
+        self._init_predicate_head(num_goal_predicates)
+
+    def disable_predicate_vector_head(self) -> None:
+        self.belief_weight = None
+        self.belief_bias = None
+        self.enable_predicate_head = False
+        self.num_goal_predicates = 0
+
+    def add_goal_predicates(self, num_new: int) -> None:
+        num_new_i = int(num_new)
+        if num_new_i <= 0:
+            raise ValueError("num_new must be positive")
+
+        if (self.belief_weight is None) or (self.belief_bias is None):
+            self._init_predicate_head(num_new_i)
+            return
+
+        device = self.belief_weight.device
+        dtype = self.belief_weight.dtype
+        old_weight = self.belief_weight.data
+        old_bias = self.belief_bias.data
+        new_weight = torch.empty((num_new_i, self.latent_size), device=device, dtype=dtype)
+        nn.init.xavier_uniform_(new_weight)
+        new_bias = torch.zeros((num_new_i,), device=device, dtype=dtype)
+
+        cat_weight = torch.cat([old_weight, new_weight], dim=0)
+        cat_bias = torch.cat([old_bias, new_bias], dim=0)
+        self.belief_weight = nn.Parameter(cat_weight)
+        self.belief_bias = nn.Parameter(cat_bias)
+        self.enable_predicate_head = True
+        self.num_goal_predicates = int(cat_weight.shape[0])
+
+    def drop_goal_predicates(self, indices: Sequence[int]) -> None:
+        if (self.belief_weight is None) or (self.belief_bias is None):
+            raise RuntimeError("Predicate vector head is not enabled")
+        if len(indices) == 0:
+            return
+
+        drop_set = {int(idx) for idx in indices}
+        max_idx = int(self.belief_weight.shape[0]) - 1
+        for idx in drop_set:
+            if idx < 0 or idx > max_idx:
+                raise IndexError("drop index out of range: {} (max={})".format(idx, max_idx))
+
+        keep_indices: List[int] = [idx for idx in range(max_idx + 1) if idx not in drop_set]
+        if len(keep_indices) == 0:
+            self.disable_predicate_vector_head()
+            return
+
+        keep = torch.as_tensor(keep_indices, dtype=torch.long, device=self.belief_weight.device)
+        kept_weight = self.belief_weight.data.index_select(0, keep)
+        kept_bias = self.belief_bias.data.index_select(0, keep)
+        self.belief_weight = nn.Parameter(kept_weight)
+        self.belief_bias = nn.Parameter(kept_bias)
+        self.enable_predicate_head = True
+        self.num_goal_predicates = int(kept_weight.shape[0])
+
+    def predicate_head_parameters(self) -> List[nn.Parameter]:
+        if (self.belief_weight is None) or (self.belief_bias is None):
+            return []
+        return [self.belief_weight, self.belief_bias]
+
+    def get_predicate_head_state_dict(self) -> Dict[str, torch.Tensor]:
+        if (self.belief_weight is None) or (self.belief_bias is None):
+            return {}
+        return {
+            "belief_weight": self.belief_weight.detach().clone(),
+            "belief_bias": self.belief_bias.detach().clone(),
+        }
+
+    def _predicate_logits_from_mu_last(self, mu_last: torch.Tensor) -> torch.Tensor:
+        if (self.belief_weight is None) or (self.belief_bias is None):
+            raise RuntimeError("Predicate vector head is not enabled")
+        if mu_last.dim() != 2 or mu_last.shape[1] != self.latent_size:
+            raise ValueError(
+                "mu_last must have shape [B, latent_size={}], got {}".format(self.latent_size, tuple(mu_last.shape))
+            )
+        return mu_last @ self.belief_weight.t() + self.belief_bias
+
+    def predicate_logits_from_mu(self, mu_last: torch.Tensor) -> torch.Tensor:
+        return self._predicate_logits_from_mu_last(mu_last)
+
+    def predicate_logits_from_mu_sequence(self, mu_seq: torch.Tensor) -> torch.Tensor:
+        if (self.belief_weight is None) or (self.belief_bias is None):
+            raise RuntimeError("Predicate vector head is not enabled")
+        if mu_seq.dim() != 3 or mu_seq.shape[-1] != self.latent_size:
+            raise ValueError(
+                "mu_seq must have shape [B, T, latent_size={}], got {}".format(
+                    self.latent_size, tuple(mu_seq.shape)
+                )
+            )
+        return mu_seq @ self.belief_weight.t() + self.belief_bias
+
+    def predicate_probs_from_mu(self, mu_last: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.predicate_logits_from_mu(mu_last))
+
+    def extract_last_mu(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        _, mu, _ = self.encode_sequence(
+            class_ids=batch["class_ids"],
+            coords=batch["coords"],
+            states=batch["states"],
+            node_mask=batch["node_mask"],
+            lengths=batch["lengths"],
+            action_ids=batch.get("action_ids"),
+        )
+        return self._pool_last(mu, batch["lengths"])
+
+    def predicate_logits_from_last_mu(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        mu_last = self.extract_last_mu(batch)
+        return self._predicate_logits_from_mu_last(mu_last)
+
+    def predicate_probs_from_last_mu(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.sigmoid(self.predicate_logits_from_last_mu(batch))
 
     def get_teacher_state_dict(self, scope: str = "backbone") -> Dict[str, torch.Tensor]:
         prefixes = self.get_teacher_prefixes(scope=scope)
@@ -302,13 +477,17 @@ class GraphSequenceVAE(nn.Module):
         state_logits = self.state_head(dec_feat)
         coord_pred = self.coord_head(dec_feat)
         mask_logits = self.mask_head(dec_feat).squeeze(-1)
+        action_logits = self.action_decoder(z) if self.reconstruct_actions else None
 
-        return {
+        outputs = {
             "class_logits": class_logits,
             "state_logits": state_logits,
             "coord_pred": coord_pred,
             "mask_logits": mask_logits,
         }
+        if action_logits is not None:
+            outputs["action_logits"] = action_logits
+        return outputs
 
     def compute_losses(
         self,
@@ -320,9 +499,11 @@ class GraphSequenceVAE(nn.Module):
         time_mask: torch.Tensor,
         mu: torch.Tensor,
         logvar: torch.Tensor,
+        action_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         valid_nodes = node_mask * time_mask.unsqueeze(-1)
         valid_node_count = valid_nodes.sum().clamp(min=1.0)
+        valid_time_count = time_mask.sum().clamp(min=1.0)
 
         valid_index = valid_nodes > 0
         if valid_index.any():
@@ -352,14 +533,40 @@ class GraphSequenceVAE(nn.Module):
         valid_time = time_mask.unsqueeze(-1).expand_as(mask_bce)
         mask_loss = (mask_bce * valid_time).sum() / valid_time.sum().clamp(min=1.0)
 
-        kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1)
-        kl_loss = (kl * time_mask).sum() / time_mask.sum().clamp(min=1.0)
+        if self.reconstruct_actions:
+            if action_ids is None:
+                raise ValueError("reconstruct_actions=True requires action_ids in compute_losses")
+            if "action_logits" not in recon:
+                raise ValueError("reconstruct_actions=True requires action_logits in decoder outputs")
+            action_ce = F.cross_entropy(
+                recon["action_logits"].reshape(-1, self.num_actions),
+                action_ids.reshape(-1),
+                reduction="none",
+            ).reshape_as(time_mask)
+            action_loss = (action_ce * time_mask).sum() / valid_time_count
+            with torch.no_grad():
+                action_pred = recon["action_logits"].argmax(dim=-1)
+                action_acc = ((action_pred == action_ids).float() * time_mask).sum() / valid_time_count
+        else:
+            action_loss = recon["class_logits"].sum() * 0.0
+            action_acc = action_loss
+
+        kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+        kl_raw = kl_per_dim.sum(dim=-1)
+        kl_raw_loss = (kl_raw * time_mask).sum() / valid_time_count
+
+        if self.free_bits > 0.0:
+            kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
+
+        kl = kl_per_dim.sum(dim=-1)
+        kl_loss = (kl * time_mask).sum() / valid_time_count
 
         total = (
             self.class_weight * class_loss
             + self.state_weight * state_loss
             + self.coord_weight * coord_loss
             + self.mask_weight * mask_loss
+            + self.action_weight * action_loss
             + self.kl_weight * kl_loss
         )
 
@@ -369,17 +576,23 @@ class GraphSequenceVAE(nn.Module):
             "state_loss": state_loss,
             "coord_loss": coord_loss,
             "mask_loss": mask_loss,
+            "action_loss": action_loss,
+            "action_acc": action_acc,
             "kl_loss": kl_loss,
+            "kl_raw_loss": kl_raw_loss,
         }
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        action_ids = batch.get("action_ids")
+        if self.reconstruct_actions and action_ids is None:
+            raise ValueError("reconstruct_actions=True requires action_ids in batch")
         encoded, mu, logvar = self.encode_sequence(
             class_ids=batch["class_ids"],
             coords=batch["coords"],
             states=batch["states"],
             node_mask=batch["node_mask"],
             lengths=batch["lengths"],
-            action_ids=batch.get("action_ids"),
+            action_ids=action_ids,
         )
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z)
@@ -392,6 +605,7 @@ class GraphSequenceVAE(nn.Module):
             time_mask=batch["time_mask"],
             mu=mu,
             logvar=logvar,
+            action_ids=action_ids,
         )
 
         losses["z_mean_abs"] = mu.abs().mean()

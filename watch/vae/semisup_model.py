@@ -25,6 +25,8 @@ class GraphSequenceSemiSupVAE(GraphSequenceVAE):
         transformer_nhead: int = 2,
         use_actions: bool = False,
         num_actions: int = 1,
+        reconstruct_actions: bool = False,
+        action_weight: float = 0.1,
         kl_weight: float = 1.0,
         class_weight: float = 1.0,
         state_weight: float = 1.0,
@@ -51,6 +53,8 @@ class GraphSequenceSemiSupVAE(GraphSequenceVAE):
             transformer_nhead=transformer_nhead,
             use_actions=use_actions,
             num_actions=num_actions,
+            reconstruct_actions=reconstruct_actions,
+            action_weight=action_weight,
             kl_weight=kl_weight,
             class_weight=class_weight,
             state_weight=state_weight,
@@ -213,13 +217,17 @@ class GraphSequenceSemiSupVAE(GraphSequenceVAE):
         state_logits = self.state_head(dec_feat)
         coord_pred = self.coord_head(dec_feat)
         mask_logits = self.mask_head(dec_feat).squeeze(-1)
+        action_logits = self.action_decoder(z) if self.reconstruct_actions else None
 
-        return {
+        outputs = {
             "class_logits": class_logits,
             "state_logits": state_logits,
             "coord_pred": coord_pred,
             "mask_logits": mask_logits,
         }
+        if action_logits is not None:
+            outputs["action_logits"] = action_logits
+        return outputs
 
     def infer_y_probs_seq(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Run the encoder backbone and return timestep-wise y belief probabilities."""
@@ -278,6 +286,7 @@ class GraphSequenceSemiSupVAE(GraphSequenceVAE):
             time_mask=batch["time_mask"],
             mu=mu,
             logvar=logvar,
+            action_ids=batch.get("action_ids"),
         )
 
         # Multi-label supervision on y (only where labels are marked available).
