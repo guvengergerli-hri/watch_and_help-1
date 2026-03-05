@@ -1,3 +1,5 @@
+import math
+
 from torch import nn
 from .graph_nn import Transformer, GraphModel, GraphModelGGNN
 import pdb
@@ -267,7 +269,16 @@ class GoalEncoder(nn.Module):
 
 
 class GoalAttentionModel(NNBase):
-    def __init__(self, recurrent=False, hidden_size=128, num_classes=100, node_encoder=None, context_type='avg', goal_cond_mode='gt'):
+    def __init__(
+        self,
+        recurrent=False,
+        hidden_size=128,
+        num_classes=100,
+        node_encoder=None,
+        context_type='avg',
+        goal_cond_mode='gt',
+        belief_context_dim=64,
+    ):
         super(GoalAttentionModel, self).__init__(recurrent, hidden_size, hidden_size)
 
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
@@ -284,9 +295,31 @@ class GoalAttentionModel(NNBase):
         # self.goal_encoder = nn.EmbeddingBag(num_classes, hidden_size, mode='sum')
         self.context_type = context_type
         self.goal_cond_mode = goal_cond_mode
+        if self.goal_cond_mode not in ['gt', 'none', 'belief']:
+            raise ValueError("Unsupported goal_cond_mode: {}".format(self.goal_cond_mode))
+        self.belief_context_dim = int(belief_context_dim)
+        if self.belief_context_dim <= 0:
+            raise ValueError("belief_context_dim must be positive")
 
         self.fc_att_action = self.mlp2l(hidden_size * 2, hidden_size)
         self.fc_att_object = self.mlp2l(hidden_size * 2, hidden_size)
+        if self.goal_cond_mode == 'belief':
+            self.belief_item_mlp = nn.Sequential(
+                nn.Linear(3, self.belief_context_dim),
+                nn.ReLU(),
+                nn.Linear(self.belief_context_dim, self.belief_context_dim),
+                nn.ReLU(),
+            )
+            self.belief_q = nn.Linear(hidden_size, self.belief_context_dim)
+            self.belief_k = nn.Linear(self.belief_context_dim, self.belief_context_dim)
+            self.belief_v = nn.Linear(self.belief_context_dim, self.belief_context_dim)
+            self.belief_to_goal = nn.Linear(self.belief_context_dim, hidden_size * 2)
+        else:
+            self.belief_item_mlp = None
+            self.belief_q = None
+            self.belief_k = None
+            self.belief_v = None
+            self.belief_to_goal = None
         self.train()
 
     def mlp2l(self, dim_in, dim_out):
@@ -320,6 +353,46 @@ class GoalAttentionModel(NNBase):
             # goal_encoding_obj = self.goal_encoder(obj_class_name).squeeze(1)
             # goal_encoding_loc = self.goal_encoder(loc_class_name).squeeze(1)
             # goal_encoding = torch.cat([goal_encoding_obj, goal_encoding_loc], dim=-1)
+            goal_mask_action = torch.sigmoid(self.fc_att_action(goal_encoding))
+            goal_mask_object = torch.sigmoid(self.fc_att_object(goal_encoding))
+        elif self.goal_cond_mode == 'belief':
+            if self.belief_item_mlp is None or self.belief_q is None or self.belief_k is None or self.belief_v is None or self.belief_to_goal is None:
+                raise RuntimeError("belief adapter modules are not initialized")
+            if 'belief_logits' not in inputs or 'belief_probs' not in inputs:
+                raise KeyError("belief goal conditioning requires inputs['belief_logits'] and inputs['belief_probs']")
+
+            belief_logits = inputs['belief_logits'].float()
+            belief_probs = inputs['belief_probs'].float()
+            if belief_logits.dim() != 2 or belief_probs.dim() != 2:
+                raise ValueError(
+                    "belief tensors must have shape [B, K], got logits={} probs={}".format(
+                        tuple(belief_logits.shape),
+                        tuple(belief_probs.shape),
+                    )
+                )
+            if belief_logits.shape != belief_probs.shape:
+                raise ValueError(
+                    "belief logits/probs shape mismatch: {} vs {}".format(
+                        tuple(belief_logits.shape),
+                        tuple(belief_probs.shape),
+                    )
+                )
+            if belief_logits.shape[1] <= 0:
+                raise ValueError("belief tensors must have K > 0")
+
+            uncertainty = belief_probs * (1.0 - belief_probs)
+            belief_items = torch.stack([belief_logits, belief_probs, uncertainty], dim=-1)
+            belief_embed = self.belief_item_mlp(belief_items)
+
+            query = self.belief_q(context_vec)
+            key = self.belief_k(belief_embed)
+            value = self.belief_v(belief_embed)
+
+            scores = (key * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(float(self.belief_context_dim))
+            alpha = torch.softmax(scores, dim=1)
+            belief_context = (value * alpha.unsqueeze(-1)).sum(dim=1)
+
+            goal_encoding = self.belief_to_goal(belief_context)
             goal_mask_action = torch.sigmoid(self.fc_att_action(goal_encoding))
             goal_mask_object = torch.sigmoid(self.fc_att_object(goal_encoding))
         else:
@@ -423,5 +496,4 @@ class ObjNameCoordEncode(nn.Module):
         class_embedding = self.class_embedding(class_ids)
         coord_embedding = self.coord_embedding(coords)
         return torch.cat([class_embedding, coord_embedding], dim=2)
-
 

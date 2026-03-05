@@ -1015,6 +1015,7 @@ def main() -> None:
         use_actions=args.use_actions,
         max_demos=args.max_train_demos,
         stable_slots=args.stable_slots,
+        strict_action_indexing=bool(args.use_actions),
     )
     val_dataset = WatchVAEDataset(
         data_path=args.val_json,
@@ -1025,7 +1026,25 @@ def main() -> None:
         use_actions=args.use_actions,
         max_demos=args.max_val_demos,
         stable_slots=args.stable_slots,
+        strict_action_indexing=bool(args.use_actions),
     )
+    if args.use_actions:
+        train_preflight = train_dataset.get_action_preflight_summary()
+        val_preflight = val_dataset.get_action_preflight_summary()
+        print("action preflight (train):", json.dumps(train_preflight, indent=2))
+        print("action preflight (val):", json.dumps(val_preflight, indent=2))
+        if int(train_preflight.get("unknown_count", 0)) != 0:
+            raise RuntimeError(
+                "Train action preflight has unknown canonical actions: {}".format(
+                    train_preflight.get("unknown_by_key", {})
+                )
+            )
+        if int(val_preflight.get("unknown_count", 0)) != 0:
+            raise RuntimeError(
+                "Val action preflight has unknown canonical actions: {}".format(
+                    val_preflight.get("unknown_by_key", {})
+                )
+            )
     print("train demos:", len(train_dataset))
     print("val demos:", len(val_dataset))
     print("num classes:", tensorizer.num_classes)

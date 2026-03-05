@@ -344,9 +344,44 @@ def get_args():
         '--goal-cond-mode',
         type=str,
         default='gt',
-        choices=['gt', 'none'],
-        help='goal-conditioning mode: gt uses task-goal tensors; none disables goal-conditioning in the policy model',
+        choices=['gt', 'none', 'belief'],
+        help='goal-conditioning mode: gt uses task-goal tensors; none disables goal-conditioning; belief uses frozen joint-VAE beliefs',
     )
+    parser.add_argument(
+        '--belief-vae-checkpoint',
+        type=str,
+        default='',
+        help='required when --goal-cond-mode belief: path to a watch_vae_joint checkpoint for online belief inference',
+    )
+    parser.add_argument(
+        '--belief-vae-device',
+        type=str,
+        default='cuda',
+        help='device for frozen belief VAE runtime (e.g., cuda, cuda:0, cpu)',
+    )
+    parser.add_argument(
+        '--belief-context-dim',
+        type=int,
+        default=64,
+        help='belief adapter/context dimension in the policy attention head',
+    )
+    parser.add_argument(
+        '--belief-action-source',
+        type=str,
+        default='alice',
+        choices=['alice', 'self', 'none'],
+        help='action stream used for belief VAE conditioning: alice uses agent0 action, self uses RL agent action, none disables action input',
+    )
+    parser.add_argument('--belief-use-actions', action='store_true', default=True,
+                        help='enable optional action input to online belief VAE (source selected by --belief-action-source)')
+    parser.add_argument('--no-belief-use-actions', action='store_false', dest='belief_use_actions',
+                        help='disable previous-action input for online belief VAE')
+    parser.add_argument('--eval-max-episodes', type=int, default=None,
+                        help='optional cap on number of filtered eval episodes to run (useful for quick subset rollouts)')
+    parser.add_argument('--record-dir-override', type=str, default='',
+                        help='optional explicit output directory for logs/results instead of default record_dir naming')
+    parser.add_argument('--overwrite-eval-logs', action='store_true', default=False,
+                        help='if set, rerun and overwrite existing logs_agent_*.pik files during evaluation')
 
     # Optional visualization hooks for test/eval scripts.
     parser.add_argument('--viz-eval-enable', action='store_true', default=False,
@@ -402,6 +437,42 @@ def get_args():
     if args.recurrent_policy:
         assert args.algo in ['a2c', 'ppo'], \
             'Recurrent policy is not implemented for ACKTR'
+
+    if args.belief_context_dim <= 0:
+        raise ValueError('--belief-context-dim must be positive')
+
+    if args.goal_cond_mode == 'belief':
+        if args.agent_type != 'hrl_mcts':
+            raise ValueError(
+                "--goal-cond-mode belief is currently supported only with --agent_type hrl_mcts"
+            )
+        if len(str(args.belief_vae_checkpoint).strip()) == 0:
+            raise ValueError(
+                "--belief-vae-checkpoint is required when --goal-cond-mode belief"
+            )
+        if not os.path.exists(args.belief_vae_checkpoint):
+            raise FileNotFoundError(
+                "--belief-vae-checkpoint path does not exist: {}".format(args.belief_vae_checkpoint)
+            )
+        try:
+            belief_device = torch.device(args.belief_vae_device)
+        except Exception as exc:
+            raise ValueError("Invalid --belief-vae-device '{}': {}".format(args.belief_vae_device, exc)) from exc
+
+        if belief_device.type == 'cuda':
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA belief device '{}' requested, but CUDA is unavailable.".format(args.belief_vae_device)
+                )
+            if belief_device.index is not None and (
+                belief_device.index < 0 or belief_device.index >= torch.cuda.device_count()
+            ):
+                raise RuntimeError(
+                    "CUDA belief device index out of range for '{}'. Visible CUDA device count: {}.".format(
+                        args.belief_vae_device,
+                        torch.cuda.device_count(),
+                    )
+                )
 
     return args
 

@@ -62,6 +62,7 @@ class A2C:
             'num_classes': graph_helper.num_classes,
             'num_states': graph_helper.num_states,
             'goal_cond_mode': args.goal_cond_mode,
+            'belief_context_dim': args.belief_context_dim,
 
         }
 
@@ -187,7 +188,21 @@ class A2C:
         loaded = _torch_load_compat(model_path, map_location=self.device)
         model_blob = loaded[0] if isinstance(loaded, (list, tuple)) else loaded
         model_state_dict = _state_dict_from_blob(model_blob)
-        self.actor_critic.load_state_dict(model_state_dict)
+        if getattr(self.args, "goal_cond_mode", "gt") == "belief":
+            try:
+                self.actor_critic.load_state_dict(model_state_dict, strict=True)
+            except RuntimeError as exc:
+                incompatible = self.actor_critic.load_state_dict(model_state_dict, strict=False)
+                print(
+                    "Warning: non-strict load for belief mode due to checkpoint mismatch. "
+                    "missing_keys={} unexpected_keys={} reason={}".format(
+                        list(incompatible.missing_keys),
+                        list(incompatible.unexpected_keys),
+                        str(exc),
+                    )
+                )
+        else:
+            self.actor_critic.load_state_dict(model_state_dict, strict=True)
         if self.actor_critic_low_level is not None and model_path_lowlevel is not None:
             
             torch.nn.Module.dump_patches = True

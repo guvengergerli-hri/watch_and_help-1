@@ -4,6 +4,7 @@ import pickle
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -16,6 +17,7 @@ from algos.arena_mp2 import ArenaMP
 from algos.a2c_mp import A2C as A2C_MP
 from utils import utils_rl_agent
 import ray
+from watch.vae.tensorizer import ActionCanonicalizationError
 
 
 def _log(msg: str) -> None:
@@ -48,6 +50,34 @@ def _run_subprocess(cmd: list, label: str) -> int:
     else:
         _log("{} finished successfully.".format(label))
     return int(completed.returncode)
+
+
+def _write_belief_action_oov_report(
+    *,
+    record_dir: Path,
+    iter_id: int,
+    episode_id: int,
+    env_task: Dict[str, Any],
+    error: Exception,
+) -> Path:
+    report_path = record_dir / "belief_action_oov_report.json"
+    payload: Dict[str, Any] = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "iter_id": int(iter_id),
+        "episode_id": int(episode_id),
+        "task_name": env_task.get("task_name"),
+        "task_id": env_task.get("task_id"),
+        "env_id": env_task.get("env_id"),
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "traceback": traceback.format_exc(),
+    }
+    if isinstance(error, ActionCanonicalizationError):
+        payload["belief_action_error"] = error.to_dict()
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    return report_path
 
 
 def _maybe_visualize_selected_eval(
@@ -199,7 +229,7 @@ if __name__ == "__main__":
 
     args.max_episode_length = 250
     args.num_per_apartment = 20
-    args.mode = "hybrid_truegoal_quick_gt"
+    args.mode = "hybrid_truegoal_quick_belief"
     args.evaluation = True
     args.use_alice = True
     args.obs_type = "partial"
@@ -208,7 +238,10 @@ if __name__ == "__main__":
 
     with open(args.dataset_path, "rb") as f:
         env_task_set = pickle.load(f)
-    args.record_dir = "../test_results/multiBob_env_task_set_{}_{}".format(args.num_per_apartment, args.mode)
+    if str(getattr(args, "record_dir_override", "")).strip():
+        args.record_dir = str(args.record_dir_override)
+    else:
+        args.record_dir = "../test_results/multiBob_env_task_set_{}_{}".format(args.num_per_apartment, args.mode)
     executable_args = {
         "file_name": args.executable_file,
         "x_display": 0,
@@ -219,6 +252,12 @@ if __name__ == "__main__":
         env_task_set = [env_task for env_task in env_task_set if env_task["task_name"] == args.task_set]
     if len(env_task_set) == 0:
         raise RuntimeError("No episodes found after task-set filtering: {}".format(args.task_set))
+    if args.eval_max_episodes is not None:
+        if int(args.eval_max_episodes) <= 0:
+            raise ValueError("--eval-max-episodes must be positive when provided.")
+        env_task_set = env_task_set[: int(args.eval_max_episodes)]
+        if len(env_task_set) == 0:
+            raise RuntimeError("No episodes left after --eval-max-episodes cap.")
 
     if args.viz_eval_enable:
         if args.viz_mode not in ("unity", "topdown", "both"):
@@ -323,8 +362,7 @@ if __name__ == "__main__":
             )
             eval_log_path = Path(log_file_name)
 
-            if os.path.isfile(log_file_name):
-                print("exsits")
+            if os.path.isfile(log_file_name) and not bool(args.overwrite_eval_logs):
                 if (
                     args.viz_eval_enable
                     and not viz_generated
@@ -345,7 +383,19 @@ if __name__ == "__main__":
             for agent in arenas[0].agents:
                 agent.seed = seed
 
-            res = a2c.eval(episode_id)
+            try:
+                res = a2c.eval(episode_id)
+            except Exception as exc:
+                if str(getattr(args, "goal_cond_mode", "")) == "belief":
+                    report_path = _write_belief_action_oov_report(
+                        record_dir=Path(args.record_dir),
+                        iter_id=int(iter_id),
+                        episode_id=int(episode_id),
+                        env_task=env_task_set[episode_id],
+                        error=exc,
+                    )
+                    _log("Belief action inference failed. OOV report: {}".format(report_path))
+                raise
             rollout_info = res[1][0]
             finished = bool(rollout_info.get("finished", False))
             action_bundle = rollout_info.get("action", {})
@@ -372,6 +422,14 @@ if __name__ == "__main__":
                 "action": action_bundle,
                 "graph": graph_list,
                 "graph_seq": graph_list,
+                "belief_logits": rollout_info.get("belief_logits", {}),
+                "belief_probs": rollout_info.get("belief_probs", {}),
+                "belief_source": rollout_info.get("belief_source", {}),
+                "belief_action_raw": rollout_info.get("belief_action_raw", {}),
+                "belief_action_canonical": rollout_info.get("belief_action_canonical", {}),
+                "belief_action_id": rollout_info.get("belief_action_id", {}),
+                "belief_action_source_used": rollout_info.get("belief_action_source_used", {}),
+                "belief_predicate_names": rollout_info.get("belief_predicate_names", {}),
             }
 
             S[episode_id].append(finished)

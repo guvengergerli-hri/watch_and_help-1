@@ -306,6 +306,10 @@ class GraphSequenceVAE(nn.Module):
         self.enable_predicate_head = True
         self.num_goal_predicates = int(cat_weight.shape[0])
 
+    def add_belief(self, num_new: int = 1) -> None:
+        """Alias for future-facing belief vocabulary growth API."""
+        self.add_goal_predicates(num_new)
+
     def drop_goal_predicates(self, indices: Sequence[int]) -> None:
         if (self.belief_weight is None) or (self.belief_bias is None):
             raise RuntimeError("Predicate vector head is not enabled")

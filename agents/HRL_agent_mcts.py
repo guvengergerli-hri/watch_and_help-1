@@ -361,6 +361,7 @@ class HRL_agent:
             'num_classes': self.num_object_classes,
             'num_states': self.num_states,
             'goal_cond_mode': args.goal_cond_mode,
+            'belief_context_dim': args.belief_context_dim,
 
         }
 
@@ -391,6 +392,34 @@ class HRL_agent:
             self.actor_critic.cuda()
 
         self.previous_belief_graph = None
+        self.belief_vae = None
+        self._belief_vae_agent_key = "agent_{}".format(self.agent_id)
+        self._prev_action_for_belief_vae = None
+        self._belief_use_actions = bool(getattr(args, "belief_use_actions", True))
+        self._belief_action_source = str(getattr(args, "belief_action_source", "alice"))
+        self._external_belief_action_for_vae = None
+        self._external_belief_source_context = {}
+        self._last_belief_action_meta = {
+            "belief_action_source_used": self._belief_action_source,
+            "belief_action_raw": None,
+            "belief_action_canonical": None,
+            "belief_action_id": None,
+        }
+        self._cached_belief_logits = None
+        self._cached_belief_probs = None
+        self._belief_predicate_names = None
+        if args.goal_cond_mode == 'belief':
+            from watch.vae.online_inference import OnlineVAEInference
+
+            self.belief_vae = OnlineVAEInference(
+                checkpoint_path=args.belief_vae_checkpoint,
+                device=args.belief_vae_device,
+                use_actions=self._belief_use_actions,
+                strict_action_indexing=True,
+            )
+            raw_predicate_names = getattr(self.belief_vae, "goal_predicate_names", None)
+            if isinstance(raw_predicate_names, list) and len(raw_predicate_names) > 0:
+                self._belief_predicate_names = [str(name) for name in raw_predicate_names]
 
     def filtering_graph(self, graph):
         new_edges = []
@@ -418,6 +447,55 @@ class HRL_agent:
         c_state = torch.zeros(1, self.hidden_size)
         return (h_state, c_state)
 
+    def _normalize_action_for_belief_vae(self, action_str):
+        if action_str is None:
+            return None
+        if not isinstance(action_str, str):
+            return None
+        return action_str.strip()
+
+    def set_belief_action_hint(self, action_str, source_context=None):
+        self._external_belief_action_for_vae = action_str if isinstance(action_str, str) else None
+        self._external_belief_source_context = dict(source_context or {})
+
+    def _infer_belief_tensors(self, observation):
+        if self.belief_vae is None:
+            raise RuntimeError("belief VAE runtime is not initialized")
+        source_context = dict(self._external_belief_source_context or {})
+        source_context.update(
+            {
+                "belief_action_source": str(self._belief_action_source),
+                "belief_agent_id": int(self.agent_id),
+            }
+        )
+        action_for_vae = None
+        if self._belief_use_actions:
+            if self._belief_action_source == 'alice':
+                action_for_vae = self._normalize_action_for_belief_vae(self._external_belief_action_for_vae)
+            elif self._belief_action_source == 'self':
+                action_for_vae = self._normalize_action_for_belief_vae(self._prev_action_for_belief_vae)
+            elif self._belief_action_source == 'none':
+                action_for_vae = None
+            else:
+                raise ValueError("Unsupported belief action source '{}'".format(self._belief_action_source))
+        belief_out = self.belief_vae.step_with_beliefs(
+            agent_key=self._belief_vae_agent_key,
+            nodes_or_graph=observation,
+            action=action_for_vae,
+            sample=False,
+            strict_actions=True,
+            source_context=source_context,
+        )
+        self._last_belief_action_meta = {
+            "belief_action_source_used": str(self._belief_action_source),
+            "belief_action_raw": belief_out.get("action_raw"),
+            "belief_action_canonical": belief_out.get("action_canonical"),
+            "belief_action_id": belief_out.get("action_index"),
+        }
+        belief_logits = belief_out['belief_logits'].squeeze(0).numpy().astype(np.float32)
+        belief_probs = belief_out['belief_probs'].squeeze(0).numpy().astype(np.float32)
+        return belief_logits, belief_probs
+
     def reset(self, observed_graph, gt_graph, task_goal={}, seed=0):
         self.action_count = 0
         self.belief = belief.Belief(gt_graph, agent_id=self.agent_id, seed=seed)
@@ -428,6 +506,19 @@ class HRL_agent:
 
         self.id2node = {node['id']: node for node in gt_graph['nodes']}
         self.hidden_state = self.init_hidden_state()
+        if self.belief_vae is not None:
+            self.belief_vae.reset(self._belief_vae_agent_key)
+        self._prev_action_for_belief_vae = None
+        self._external_belief_action_for_vae = None
+        self._external_belief_source_context = {}
+        self._last_belief_action_meta = {
+            "belief_action_source_used": self._belief_action_source,
+            "belief_action_raw": None,
+            "belief_action_canonical": None,
+            "belief_action_id": None,
+        }
+        self._cached_belief_logits = None
+        self._cached_belief_probs = None
 
 
     def evaluate(self, rollout):
@@ -497,6 +588,30 @@ class HRL_agent:
             'mask_goal_pred': mask_goal_pred,
             'gt_goal': obj_class_id
         })
+        belief_logits = None
+        belief_probs = None
+        belief_source = None
+        if self.args.goal_cond_mode == 'belief':
+            need_fresh_belief = (
+                self.action_count == 0
+                or self._cached_belief_logits is None
+                or self._cached_belief_probs is None
+            )
+            if need_fresh_belief:
+                belief_logits, belief_probs = self._infer_belief_tensors(observation)
+                self._cached_belief_logits = belief_logits.copy()
+                self._cached_belief_probs = belief_probs.copy()
+                belief_source = 'fresh'
+            else:
+                belief_logits = np.array(self._cached_belief_logits, copy=True)
+                belief_probs = np.array(self._cached_belief_probs, copy=True)
+                belief_source = 'carry'
+
+        if self.args.goal_cond_mode == 'belief' and self.action_count == 0 and belief_logits is not None and belief_probs is not None:
+            inputs.update({
+                'belief_logits': belief_logits,
+                'belief_probs': belief_probs,
+            })
 
         inputs_tensor = {}
         for input_name, inp in inputs.items():
@@ -538,6 +653,16 @@ class HRL_agent:
             info_model['actions'] = next_action
 
         info_model['obs'] = observation['nodes']
+        if self.args.goal_cond_mode == 'belief':
+            info_model['belief_logits'] = belief_logits
+            info_model['belief_probs'] = belief_probs
+            info_model['belief_source'] = belief_source
+            info_model['belief_action_source_used'] = self._last_belief_action_meta.get("belief_action_source_used")
+            info_model['belief_action_raw'] = self._last_belief_action_meta.get("belief_action_raw")
+            info_model['belief_action_canonical'] = self._last_belief_action_meta.get("belief_action_canonical")
+            info_model['belief_action_id'] = self._last_belief_action_meta.get("belief_action_id")
+            if self._belief_predicate_names is not None:
+                info_model['belief_predicate_names'] = list(self._belief_predicate_names)
 
         action_str, action_tried, plan, predicate = self.get_action_instr(next_action, visible_objects, observation_belief)
         if "put" in predicate:
@@ -570,6 +695,8 @@ class HRL_agent:
         info_model['predicate'] = predicate
         # print('ACTIONS', info_model['actions'], action_str, action_probs[0],
         #       'IDS', inputs_tensor['node_ids'][0, :4])
+        if self.args.goal_cond_mode == 'belief':
+            self._prev_action_for_belief_vae = action_str if isinstance(action_str, str) else None
 
 
         return action_str, info_model

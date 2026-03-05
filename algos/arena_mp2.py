@@ -22,6 +22,20 @@ class ArenaMP(object):
         self.env = environment_fn(arena_id)
         for agent_type_fn in agent_fn:
             self.agents.append(agent_type_fn(arena_id, self.env))
+        for agent_idx, agent in enumerate(self.agents):
+            goal_mode = str(getattr(getattr(agent, "args", None), "goal_cond_mode", "gt"))
+            action_source = str(getattr(getattr(agent, "args", None), "belief_action_source", "self"))
+            if 'RL' in str(getattr(agent, "agent_type", "")) and goal_mode == "belief" and action_source == "alice":
+                if self.num_agents < 2:
+                    raise ValueError(
+                        "belief-action-source=alice requires at least two agents (Alice+Bob), got {}.".format(
+                            self.num_agents
+                        )
+                    )
+                if int(agent_idx) == 0:
+                    raise ValueError(
+                        "belief-action-source=alice requires Alice action to be produced before RL belief inference."
+                    )
 
         self.max_episode_length = self.env.max_episode_length
         self.max_number_steps = max_number_steps
@@ -55,6 +69,7 @@ class ArenaMP(object):
         # ipdb.set_trace()
         dict_actions, dict_info = {}, {}
         op_subgoal = {0: None, 1: None}
+        env_step = int(getattr(self.env, "steps", 0))
         # pdb.set_trace()
 
         for it, agent in enumerate(self.agents):
@@ -72,6 +87,38 @@ class ArenaMP(object):
                 dict_actions[it], dict_info[it] = agent.get_action(obs[it], goal_spec, opponent_subgoal)
                 
             elif 'RL' in agent.agent_type:
+                if hasattr(agent, "set_belief_action_hint"):
+                    belief_action_source = str(getattr(getattr(agent, "args", None), "belief_action_source", "self"))
+                    task_id_val = getattr(self.env, "task_id", None)
+                    env_id_val = getattr(self.env, "env_id", None)
+                    try:
+                        task_id_val = None if task_id_val is None else int(task_id_val)
+                    except Exception:
+                        task_id_val = str(task_id_val)
+                    try:
+                        env_id_val = None if env_id_val is None else int(env_id_val)
+                    except Exception:
+                        env_id_val = str(env_id_val)
+                    belief_source_context = {
+                        "mode": "rl_inference",
+                        "arena_id": int(self.arena_id),
+                        "env_step": int(env_step),
+                        "task_name": str(getattr(self.env, "task_name", "unknown")),
+                        "task_id": task_id_val,
+                        "env_id": env_id_val,
+                        "belief_agent_index": int(it),
+                        "belief_action_source": belief_action_source,
+                    }
+                    if belief_action_source == "alice":
+                        if 0 not in dict_actions:
+                            raise RuntimeError(
+                                "belief-action-source=alice requires Alice action (agent index 0) before RL agent {}."
+                                .format(it)
+                            )
+                        belief_source_context["alice_agent_index"] = 0
+                        agent.set_belief_action_hint(dict_actions.get(0), source_context=belief_source_context)
+                    else:
+                        agent.set_belief_action_hint(None, source_context=belief_source_context)
                 if 'MCTS' in agent.agent_type or 'Random' in agent.agent_type:
                     if true_graph:
                         full_graph = self.env.get_graph()
@@ -145,7 +192,7 @@ class ArenaMP(object):
 
         if logging > 1:
             info_rollout['step_info'] = []
-            info_rollout['action'] = {0: [], 1: []}
+            info_rollout['action'] = {agent_id: [] for agent_id in range(self.num_agents)}
             info_rollout['script'] = []
             info_rollout['graph'] = []
             info_rollout['action_space_ids'] = []
@@ -155,6 +202,14 @@ class ArenaMP(object):
             info_rollout['reward'] = []
             info_rollout['goals_finished'] = []
             info_rollout['obs'] = []
+            info_rollout['belief_logits'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_probs'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_source'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_action_raw'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_action_canonical'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_action_id'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_action_source_used'] = {agent_id: [] for agent_id in range(self.num_agents)}
+            info_rollout['belief_predicate_names'] = {}
 
         rollout_agent = {}
 
@@ -287,8 +342,25 @@ class ArenaMP(object):
 
                     # pdb.set_trace()
                     for agenti in range(len(self.agents)):
-                        info_rollout['action'][agenti].append(agent_actions[agenti])
-                        info_rollout['obs'].append(agent_info[agenti].get('obs'))
+                        agent_step_info = agent_info.get(agenti, {})
+                        info_rollout['action'][agenti].append(agent_actions.get(agenti))
+                        info_rollout['obs'].append(agent_step_info.get('obs'))
+                        if 'belief_logits' in agent_step_info:
+                            info_rollout['belief_logits'][agenti].append(agent_step_info['belief_logits'])
+                        if 'belief_probs' in agent_step_info:
+                            info_rollout['belief_probs'][agenti].append(agent_step_info['belief_probs'])
+                        if 'belief_source' in agent_step_info:
+                            info_rollout['belief_source'][agenti].append(agent_step_info['belief_source'])
+                        if 'belief_action_raw' in agent_step_info:
+                            info_rollout['belief_action_raw'][agenti].append(agent_step_info['belief_action_raw'])
+                        if 'belief_action_canonical' in agent_step_info:
+                            info_rollout['belief_action_canonical'][agenti].append(agent_step_info['belief_action_canonical'])
+                        if 'belief_action_id' in agent_step_info:
+                            info_rollout['belief_action_id'][agenti].append(agent_step_info['belief_action_id'])
+                        if 'belief_action_source_used' in agent_step_info:
+                            info_rollout['belief_action_source_used'][agenti].append(agent_step_info['belief_action_source_used'])
+                        if 'belief_predicate_names' in agent_step_info and agenti not in info_rollout['belief_predicate_names']:
+                            info_rollout['belief_predicate_names'][agenti] = list(agent_step_info['belief_predicate_names'])
 
                     info_rollout['action_tried'].append(agent_info[agent_id]['action_tried'])
                     if 'predicate' in agent_info[agent_id]:
@@ -446,21 +518,30 @@ class ArenaMP(object):
         if pred_goal is not None:
             self.task_goal = copy.deepcopy(pred_goal)
 
+        per_agent_seq = {agent_id: [] for agent_id in range(self.num_agents)}
         saved_info = {'task_id': self.env.task_id,
                       'env_id': self.env.env_id,
                       'task_name': self.env.task_name,
                       'gt_goals': self.env.task_goal[0],
                       'goals': self.task_goal,
-                      'action': {0: [], 1: []},
-                      'plan': {0: [], 1: []},
-                      'subgoals': {0: [], 1: []},
+                      'action': copy.deepcopy(per_agent_seq),
+                      'plan': copy.deepcopy(per_agent_seq),
+                      'subgoals': copy.deepcopy(per_agent_seq),
                       'finished': None,
                       'init_unity_graph': self.env.init_graph,
                       'graph_seq': [],
                       'reward_seq': [],
                       'goals_finished': [],
-                      'belief': {0: [], 1: []},
-                      'belief_graph': {0: [], 1: []},
+                      'belief': copy.deepcopy(per_agent_seq),
+                      'belief_graph': copy.deepcopy(per_agent_seq),
+                      'belief_logits': copy.deepcopy(per_agent_seq),
+                      'belief_probs': copy.deepcopy(per_agent_seq),
+                      'belief_source': copy.deepcopy(per_agent_seq),
+                      'belief_action_raw': copy.deepcopy(per_agent_seq),
+                      'belief_action_canonical': copy.deepcopy(per_agent_seq),
+                      'belief_action_id': copy.deepcopy(per_agent_seq),
+                      'belief_action_source_used': copy.deepcopy(per_agent_seq),
+                      'belief_predicate_names': {},
                       'obs': []}
         try:
             saved_info['graph_seq'].append(copy.deepcopy(self.env.get_graph()))
@@ -487,6 +568,22 @@ class ArenaMP(object):
                     saved_info['belief_graph'][agent_id].append(info['belief_graph'])
                 if 'belief' in info:
                     saved_info['belief'][agent_id].append(info['belief'])
+                if 'belief_logits' in info:
+                    saved_info['belief_logits'][agent_id].append(info['belief_logits'])
+                if 'belief_probs' in info:
+                    saved_info['belief_probs'][agent_id].append(info['belief_probs'])
+                if 'belief_source' in info:
+                    saved_info['belief_source'][agent_id].append(info['belief_source'])
+                if 'belief_action_raw' in info:
+                    saved_info['belief_action_raw'][agent_id].append(info['belief_action_raw'])
+                if 'belief_action_canonical' in info:
+                    saved_info['belief_action_canonical'][agent_id].append(info['belief_action_canonical'])
+                if 'belief_action_id' in info:
+                    saved_info['belief_action_id'][agent_id].append(info['belief_action_id'])
+                if 'belief_action_source_used' in info:
+                    saved_info['belief_action_source_used'][agent_id].append(info['belief_action_source_used'])
+                if 'belief_predicate_names' in info and agent_id not in saved_info['belief_predicate_names']:
+                    saved_info['belief_predicate_names'][agent_id] = list(info['belief_predicate_names'])
                 if 'plan' in info:
                     saved_info['plan'][agent_id].append(info['plan'][:3])
                 if 'subgoals' in info:

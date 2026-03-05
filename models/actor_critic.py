@@ -51,6 +51,7 @@ class ActorCritic(nn.Module):
 
         encoder_kwargs = dict(base_kwargs)
         goal_cond_mode = encoder_kwargs.pop('goal_cond_mode', 'gt')
+        belief_context_dim = int(encoder_kwargs.pop('belief_context_dim', 64))
         node_encoder = base(**encoder_kwargs)
         self.hidden_size = base_kwargs['hidden_size']
         self.base = base_nets.GoalAttentionModel(hidden_size=base_kwargs['hidden_size'],
@@ -58,7 +59,8 @@ class ActorCritic(nn.Module):
                                                  num_classes=base_kwargs['num_classes'],
                                                   node_encoder=node_encoder,
                                                  context_type=context_type,
-                                                 goal_cond_mode=goal_cond_mode)
+                                                 goal_cond_mode=goal_cond_mode,
+                                                 belief_context_dim=belief_context_dim)
         self.critic_linear = init_(nn.Linear(base_kwargs['hidden_size'], 1))
 
         # Distribution for the actions

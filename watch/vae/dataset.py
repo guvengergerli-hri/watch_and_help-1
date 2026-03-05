@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -27,6 +28,7 @@ class WatchVAEDataset(Dataset):
         use_actions: bool = False,
         max_demos: Optional[int] = None,
         stable_slots: bool = True,
+        strict_action_indexing: bool = False,
     ):
         self.data_path = data_path
         self.split_key = split_key
@@ -35,11 +37,16 @@ class WatchVAEDataset(Dataset):
         self.min_seq_len = max(1, int(min_seq_len))
         self.use_actions = use_actions
         self.stable_slots = stable_slots
+        self.strict_action_indexing = bool(strict_action_indexing)
 
         demos = _load_split(data_path, split_key)
         self.demos: List[Dict[str, Any]] = []
 
-        for demo in demos:
+        actions_scanned = 0
+        unique_canonical = set()
+        unknown_counter: Counter = Counter()
+
+        for demo_idx, demo in enumerate(demos):
             graphs = demo.get("graphs", [])
             actions = demo.get("valid_action_with_walk", [])
 
@@ -53,6 +60,49 @@ class WatchVAEDataset(Dataset):
 
             if seq_len < self.min_seq_len:
                 continue
+
+            if self.use_actions:
+                demo_name = str(demo.get("name", "unknown"))
+                demo_task_name = str(demo.get("task_name", "unknown"))
+                for step_idx in range(seq_len):
+                    source_context = {
+                        "mode": "watch_dataset",
+                        "data_path": str(self.data_path),
+                        "split_key": str(self.split_key),
+                        "demo_name": demo_name,
+                        "task_name": demo_task_name,
+                        "demo_index": int(demo_idx),
+                        "step_idx": int(step_idx),
+                    }
+                    action_entry = actions[step_idx]
+                    action_id, action_meta = self.tensorizer.action_index(
+                        action_entry,
+                        strict=False,
+                        source_context=source_context,
+                        return_details=True,
+                    )
+                    canonical_key = action_meta.get("canonical_key")
+                    if canonical_key is not None:
+                        canonical_key = str(canonical_key)
+                        unique_canonical.add(canonical_key)
+                        if canonical_key not in self.tensorizer.action_to_idx:
+                            unknown_counter[canonical_key] += 1
+                            if self.strict_action_indexing:
+                                # Re-run in strict mode to raise structured diagnostics.
+                                self.tensorizer.action_index(
+                                    action_entry,
+                                    strict=True,
+                                    source_context=source_context,
+                                )
+                    elif self.strict_action_indexing and action_entry is not None:
+                        # Non-null malformed actions should fail-fast in strict mode.
+                        self.tensorizer.action_index(
+                            action_entry,
+                            strict=True,
+                            source_context=source_context,
+                        )
+                    _ = action_id
+                    actions_scanned += 1
 
             # Precompute stable slot-map once at dataset construction time to avoid
             # mutating per-sample state inside DataLoader worker processes.
@@ -75,6 +125,13 @@ class WatchVAEDataset(Dataset):
             )
             if max_demos is not None and len(self.demos) >= int(max_demos):
                 break
+
+        self.action_preflight = {
+            "actions_scanned": int(actions_scanned),
+            "unique_canonical_actions": int(len(unique_canonical)),
+            "unknown_count": int(sum(unknown_counter.values())),
+            "unknown_by_key": dict(sorted([(str(k), int(v)) for k, v in unknown_counter.items()], key=lambda kv: kv[0])),
+        }
 
     def __len__(self) -> int:
         return len(self.demos)
@@ -106,7 +163,22 @@ class WatchVAEDataset(Dataset):
             mask_seq.append(frame["mask_object"])
 
             if self.use_actions:
-                action_seq.append(self.tensorizer.action_index(demo["actions"][step_idx]))
+                source_context = {
+                    "mode": "watch_dataset",
+                    "data_path": str(self.data_path),
+                    "split_key": str(self.split_key),
+                    "demo_name": str(demo.get("name", "unknown")),
+                    "task_name": str(demo.get("task_name", "unknown")),
+                    "step_idx": int(step_idx),
+                    "dataset_index": int(index),
+                }
+                action_seq.append(
+                    self.tensorizer.action_index(
+                        demo["actions"][step_idx],
+                        strict=bool(self.strict_action_indexing),
+                        source_context=source_context,
+                    )
+                )
 
         output: Dict[str, Any] = {
             "dataset_index": int(index),
@@ -124,6 +196,16 @@ class WatchVAEDataset(Dataset):
             output["action_ids"] = torch.tensor(action_seq, dtype=torch.long)
 
         return output
+
+    def get_action_preflight_summary(self) -> Dict[str, Any]:
+        return {
+            "actions_scanned": int(self.action_preflight.get("actions_scanned", 0)),
+            "unique_canonical_actions": int(self.action_preflight.get("unique_canonical_actions", 0)),
+            "unknown_count": int(self.action_preflight.get("unknown_count", 0)),
+            "unknown_by_key": dict(self.action_preflight.get("unknown_by_key", {})),
+            "strict_action_indexing": bool(self.strict_action_indexing),
+            "use_actions": bool(self.use_actions),
+        }
 
 
 def collate_watch_vae(batch: List[Dict[str, Any]]) -> Dict[str, Any]:

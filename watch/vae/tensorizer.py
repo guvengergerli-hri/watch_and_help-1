@@ -1,6 +1,7 @@
 import copy
+import difflib
 import json
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -8,6 +9,83 @@ import numpy as np
 ActionEntry = Union[str, Sequence[Any]]
 NodesInput = Union[Dict[str, Any], List[Dict[str, Any]]]
 SlotMap = Dict[int, int]
+
+
+DEFAULT_ACTION_OBJECT_ALIASES: Dict[str, str] = {
+    "kitchencabinet": "kitchencabinets",
+}
+DEFAULT_ACTION_VERB_ALIASES: Dict[str, str] = {
+    "[walktowards]": "[walk]",
+}
+
+
+class ActionCanonicalizationError(ValueError):
+    """Structured action parsing error shared by Watch train/inference."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_action: Optional[str],
+        normalized_action: Optional[str],
+        canonical_key: Optional[str],
+        source_context: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.raw_action = raw_action
+        self.normalized_action = normalized_action
+        self.canonical_key = canonical_key
+        self.source_context = dict(source_context or {})
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error_type": self.__class__.__name__,
+            "message": str(self),
+            "raw_action": self.raw_action,
+            "normalized_action": self.normalized_action,
+            "canonical_key": self.canonical_key,
+            "source_context": dict(self.source_context),
+        }
+
+
+class UnknownActionKeyError(ActionCanonicalizationError):
+    """Raised when canonical action key is absent from metadata vocab in strict mode."""
+
+    def __init__(
+        self,
+        *,
+        raw_action: Optional[str],
+        normalized_action: Optional[str],
+        canonical_key: Optional[str],
+        known_vocab_size: int,
+        nearest_candidates: Sequence[str],
+        source_context: Optional[Dict[str, Any]] = None,
+    ):
+        message = (
+            "Unknown action key '{}' (vocab size {}).".format(
+                canonical_key,
+                int(known_vocab_size),
+            )
+        )
+        super().__init__(
+            message,
+            raw_action=raw_action,
+            normalized_action=normalized_action,
+            canonical_key=canonical_key,
+            source_context=source_context,
+        )
+        self.known_vocab_size = int(known_vocab_size)
+        self.nearest_candidates = [str(item) for item in nearest_candidates]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(
+            {
+                "known_vocab_size": int(self.known_vocab_size),
+                "nearest_candidates": list(self.nearest_candidates),
+            }
+        )
+        return payload
 
 
 class WatchGraphTensorizer:
@@ -27,6 +105,8 @@ class WatchGraphTensorizer:
         class_to_idx: Optional[Dict[str, int]] = None,
         state_to_idx: Optional[Dict[str, int]] = None,
         action_to_idx: Optional[Dict[str, int]] = None,
+        action_object_aliases: Optional[Dict[str, str]] = None,
+        action_verb_aliases: Optional[Dict[str, str]] = None,
     ):
         if metadata_path is not None:
             with open(metadata_path, "r") as f:
@@ -46,6 +126,8 @@ class WatchGraphTensorizer:
         self.class_to_idx = copy.deepcopy(class_to_idx)
         self.state_to_idx = copy.deepcopy(state_to_idx)
         self.action_to_idx = copy.deepcopy(action_to_idx or {})
+        self.action_object_aliases = copy.deepcopy(action_object_aliases or DEFAULT_ACTION_OBJECT_ALIASES)
+        self.action_verb_aliases = copy.deepcopy(action_verb_aliases or DEFAULT_ACTION_VERB_ALIASES)
         self.max_nodes = int(max_nodes)
 
         self.unknown_class_idx = self.class_to_idx.get("None", 0)
@@ -59,6 +141,8 @@ class WatchGraphTensorizer:
             "class_to_idx": copy.deepcopy(self.class_to_idx),
             "state_to_idx": copy.deepcopy(self.state_to_idx),
             "action_to_idx": copy.deepcopy(self.action_to_idx),
+            "action_object_aliases": copy.deepcopy(self.action_object_aliases),
+            "action_verb_aliases": copy.deepcopy(self.action_verb_aliases),
             "max_nodes": self.max_nodes,
         }
 
@@ -70,6 +154,8 @@ class WatchGraphTensorizer:
             class_to_idx=config["class_to_idx"],
             state_to_idx=config["state_to_idx"],
             action_to_idx=config.get("action_to_idx", {}),
+            action_object_aliases=config.get("action_object_aliases"),
+            action_verb_aliases=config.get("action_verb_aliases"),
         )
 
     def _extract_nodes(self, graph_or_nodes: NodesInput) -> List[Dict[str, Any]]:
@@ -270,18 +356,112 @@ class WatchGraphTensorizer:
 
         return encoded
 
-    def action_index(self, action_entry: Optional[ActionEntry]) -> int:
+    def _extract_action_script(self, action_entry: Optional[ActionEntry]) -> Optional[Any]:
         if action_entry is None:
-            return 0
-        script = action_entry
-        if isinstance(action_entry, (list, tuple)) and len(action_entry) > 0:
-            script = action_entry[0]
-        if not isinstance(script, str):
-            return 0
+            return None
+        if isinstance(action_entry, (list, tuple)):
+            if len(action_entry) == 0:
+                return None
+            return action_entry[0]
+        return action_entry
 
-        # Match the existing watch preprocessing key format: "[action] <object>".
-        tokens = script.split(" ")
-        if len(tokens) < 2:
-            return 0
-        predicate_name = "{} {}".format(tokens[0], tokens[1])
-        return int(self.action_to_idx.get(predicate_name, 0))
+    def _canonicalize_action_object_token(self, obj_token: str) -> str:
+        token = str(obj_token)
+        if token.startswith("<") and token.endswith(">") and len(token) >= 3:
+            raw_name = token[1:-1]
+            alias_name = self.action_object_aliases.get(raw_name, raw_name)
+            return "<{}>".format(alias_name)
+        return str(self.action_object_aliases.get(token, token))
+
+    def canonicalize_action_entry(
+        self,
+        action_entry: Optional[ActionEntry],
+        *,
+        strict: bool = False,
+        source_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Normalize action text to a canonical key: "[verb] <object>"."""
+        source_ctx = dict(source_context or {})
+        script = self._extract_action_script(action_entry)
+        if script is None:
+            return {"raw_action": None, "normalized_action": None, "canonical_key": None}
+        if not isinstance(script, str):
+            raw_action = str(script)
+            if strict:
+                raise ActionCanonicalizationError(
+                    "Action entry must contain a string script.",
+                    raw_action=raw_action,
+                    normalized_action=None,
+                    canonical_key=None,
+                    source_context=source_ctx,
+                )
+            return {"raw_action": raw_action, "normalized_action": None, "canonical_key": None}
+
+        raw_action = script
+        normalized_tokens = raw_action.strip().split()
+        normalized_action = " ".join(normalized_tokens) if len(normalized_tokens) > 0 else ""
+        if len(normalized_tokens) < 2:
+            if strict:
+                raise ActionCanonicalizationError(
+                    "Action script must include verb and object tokens.",
+                    raw_action=raw_action,
+                    normalized_action=normalized_action,
+                    canonical_key=None,
+                    source_context=source_ctx,
+                )
+            return {"raw_action": raw_action, "normalized_action": normalized_action, "canonical_key": None}
+
+        verb = str(self.action_verb_aliases.get(normalized_tokens[0], normalized_tokens[0]))
+        obj = self._canonicalize_action_object_token(normalized_tokens[1])
+        normalized_tokens[0] = verb
+        normalized_tokens[1] = obj
+        normalized_action = " ".join(normalized_tokens)
+        canonical_key = "{} {}".format(verb, obj)
+        return {
+            "raw_action": raw_action,
+            "normalized_action": normalized_action,
+            "canonical_key": canonical_key,
+        }
+
+    def action_index(
+        self,
+        action_entry: Optional[ActionEntry],
+        *,
+        strict: bool = False,
+        source_context: Optional[Dict[str, Any]] = None,
+        return_details: bool = False,
+    ) -> Union[int, Tuple[int, Dict[str, Any]]]:
+        meta = self.canonicalize_action_entry(
+            action_entry,
+            strict=bool(strict),
+            source_context=source_context,
+        )
+        canonical_key = meta.get("canonical_key")
+        action_idx = 0
+        if canonical_key is not None:
+            lookup = self.action_to_idx.get(str(canonical_key))
+            if lookup is None:
+                if strict:
+                    all_keys = sorted([str(key) for key in self.action_to_idx.keys()])
+                    near = difflib.get_close_matches(str(canonical_key), all_keys, n=5, cutoff=0.0)
+                    raise UnknownActionKeyError(
+                        raw_action=meta.get("raw_action"),
+                        normalized_action=meta.get("normalized_action"),
+                        canonical_key=str(canonical_key),
+                        known_vocab_size=len(all_keys),
+                        nearest_candidates=near,
+                        source_context=source_context,
+                    )
+                action_idx = 0
+            else:
+                action_idx = int(lookup)
+
+        details = {
+            "raw_action": meta.get("raw_action"),
+            "normalized_action": meta.get("normalized_action"),
+            "canonical_key": meta.get("canonical_key"),
+            "action_index": int(action_idx),
+        }
+        if return_details:
+            return int(action_idx), details
+        return int(action_idx)
